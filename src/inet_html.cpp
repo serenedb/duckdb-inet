@@ -1,10 +1,11 @@
 #include "inet_html.hpp"
 #include "inet_html_table.hpp"
-#include "duckdb/duckdb_stable.hpp"
 
+#include <charconv>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdexcept>
 #include <stdlib.h>
 #include <string.h>
 
@@ -128,16 +129,14 @@ static bool decode_codepoint(uint32_t cp, uint32_t *sz, char *c) {
 }
 
 int64_t strtoll_non_null_terminated(const char *str, const char *end, const char **num_end, int base) {
-	idx_t pos = 0;
-	int64_t result;
-	if (base == 10) {
-		result = duckdb_stable::StringUtil::ToSigned(str, end - str, pos);
-	} else if (base == 16) {
-		result = static_cast<int64_t>(duckdb_stable::StringUtil::FromHex(str, end - str, pos));
-	} else {
-		throw std::runtime_error("Unsupported base");
+	int64_t result = 0;
+	auto [ptr, ec] = std::from_chars(str, end, result, base);
+	if (ec == std::errc::invalid_argument) {
+		throw std::runtime_error("Not a number");
+	} else if (ec == std::errc::result_out_of_range) {
+		throw std::runtime_error("Out of int64 range");
 	}
-	*num_end = str + pos;
+	*num_end = ptr;
 	return result;
 }
 
