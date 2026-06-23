@@ -1,7 +1,7 @@
-#include "inet_extension.hpp"
+#include "duckdb/inet/inet_extension.hpp"
 
-#include "inet_ipaddress.hpp"
-#include "inet_html.hpp"
+#include "duckdb/inet/inet_ipaddress.hpp"
+#include "duckdb/inet/inet_html.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"

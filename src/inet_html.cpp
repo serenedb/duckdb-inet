@@ -1,5 +1,5 @@
-#include "inet_html.hpp"
-#include "inet_html_table.hpp"
+#include "duckdb/inet/inet_html.hpp"
+#include "duckdb/inet/inet_html_table.hpp"
 
 #include <charconv>
 #include <ctype.h>

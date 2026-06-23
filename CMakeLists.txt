@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 2.8.12...3.29)
 
 project(INETExtension)
 
-include_directories(src/include src)
+# Headers live under src/duckdb/inet/ and are included as <duckdb/inet/...>,
+# so src is the include root.
+include_directories(src)
 
 set(INET_EXTENSION_FILES
     src/inet_extension.cpp
