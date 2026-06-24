@@ -1,4 +1,4 @@
-#include "inet_ipaddress.hpp"
+#include "duckdb/inet/inet_ipaddress.hpp"
 
 #include <string.h>
 #include <stdio.h>
@@ -448,10 +448,9 @@ size_t ipaddress_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer
 }
 
 INET_IPAddress ipaddress_netmask(const INET_IPAddress *ip) {
-	duckdb_uhugeint ipv4_mask = { IPV4_NETWORK_MASK, 0 };
-	duckdb_uhugeint ip_shift = { ip->mask, 0 };
-	duckdb_uhugeint mask =
-	    ip->type == INET_IP_ADDRESS_V4 ? ipv4_mask : IPV6_NETWORK_MASK;
+	duckdb_uhugeint ipv4_mask = {IPV4_NETWORK_MASK, 0};
+	duckdb_uhugeint ip_shift = {ip->mask, 0};
+	duckdb_uhugeint mask = ip->type == INET_IP_ADDRESS_V4 ? ipv4_mask : IPV6_NETWORK_MASK;
 	duckdb_uhugeint shift = uhugeint_shift_right(mask, ip_shift);
 	duckdb_uhugeint netmask = uhugeint_xor(mask, shift);
 
