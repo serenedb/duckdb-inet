@@ -1,4 +1,4 @@
-#include "inet_ipaddress.hpp"
+#include "duckdb/inet/inet_ipaddress.hpp"
 
 #include <string.h>
 #include <stdio.h>
