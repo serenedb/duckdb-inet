@@ -2,6 +2,7 @@
 
 #include "duckdb/inet/inet_ipaddress.hpp"
 #include "duckdb/inet/inet_html.hpp"
+#include "duckdb/inet/inet_type.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -23,13 +24,13 @@ namespace duckdb {
 //----------------------------------------------------------------------------------------------------------------------
 using INET_T = StructTypeTernary<uint8_t, hugeint_t, uint16_t>;
 
-static LogicalType make_inet_type() {
+LogicalType make_inet_type() {
 	child_list_t<LogicalType> children;
 	children.push_back(make_pair("ip_type", LogicalType::UTINYINT));
 	children.push_back(make_pair("address", LogicalType::HUGEINT));
 	children.push_back(make_pair("mask", LogicalType::USMALLINT));
 	auto inet_type = LogicalType::STRUCT(std::move(children));
-	inet_type.SetAlias("INET");
+	inet_type.SetAlias(INET_TYPE_NAME);
 	return inet_type;
 }
 
