@@ -1,6 +1,6 @@
 #pragma once
 
-#include "duckdb_extension.h"
+#include "duckdb.h"
 
 #include <stdint.h>
 
