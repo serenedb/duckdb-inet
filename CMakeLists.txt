@@ -16,6 +16,8 @@ build_static_extension(inet ${INET_EXTENSION_FILES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(inet ${PARAMETERS} ${INET_EXTENSION_FILES})
 
+target_include_directories(inet_extension SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 install(
   TARGETS inet_extension
   EXPORT "${DUCKDB_EXPORT_SET}"
