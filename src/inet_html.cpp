@@ -1,10 +1,11 @@
-#include "inet_html.hpp"
-#include "inet_html_table.hpp"
-#include "duckdb/duckdb_stable.hpp"
+#include "duckdb/inet/inet_html.hpp"
+#include "duckdb/inet/inet_html_table.hpp"
 
+#include <charconv>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdexcept>
 #include <stdlib.h>
 #include <string.h>
 
@@ -56,38 +57,38 @@ static bool decode_codepoint(uint32_t cp, uint32_t *sz, char *c) {
 	// Special character references
 	if (0x80 <= cp && cp <= 0x9F) {
 		static const char *map[] = {
-			"\xE2\x82\xAC", // EURO SIGN
-		    "\\x81",		// UNDEFINED
-			"\xE2\x80\x9A", // SINGLE LOW-9 QUOTATION MARK
-			"\xC6\x92",		// LATIN SMALL LETTER F WITH HOOK
-			"\xE2\x80\x9E", // DOUBLE LOW-9 QUOTATION MARK
-			"\xE2\x80\xA6", // HORIZONTAL ELLIPSIS
-			"\xE2\x80\xA0", // DAGGER
-			"\xE2\x80\xA1", // DOUBLE DAGGER
-			"\xCB\x86",		// MODIFIER LETTER CIRCUMFLEX ACCENT
-			"\xE2\x80\xB0", // PER MILLE SIGN
-			"\xC5\xA0",		// LATIN CAPITAL LETTER S WITH CARON
-			"\xE2\x80\xB9", // SINGLE LEFT-POINTING ANGLE QUOTATION MARK
-			"\xC5\x92",		// LATIN CAPITAL LIGATURE O
-			"\\x8d",		// UNDEFINED
-			"\xC5\xBD",		// LATIN CAPITAL LETTER Z WITH CARON
-			"\\x8f",		// UNDEFINED
-			"\\x90",		// UNDEFINED
-			"\xE2\x80\x98", // LEFT SINGLE QUOTATION MARK
-			"\xE2\x80\x99", // RIGHT SINGLE QUOTATION MARK
-			"\xE2\x80\x9C", // LEFT DOUBLE QUOTATION MARK
-			"\xE2\x80\x9D", // RIGHT DOUBLE QUOTATION MARK
-			"\xE2\x80\xA2", // BULLET
-			"\xE2\x80\x93", // EN DASH
-			"\xE2\x80\x94", // EM DASH
-			"\xCB\x9C",		// SMALL TILDE
-			"\xE2\x84\xA2", // TRADE MARK SIGN
-			"\xC5\xA1",		// LATIN SMALL LETTER S WITH CARON
-			"\xE2\x80\xBA", // SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
-			"\xC5\x93",		// LATIN SMALL LIGATURE OE
-			"\\x9d",		// UNDEFINED
-			"\xC5\xBE",		// LATIN SMALL LETTER Z WITH CARON
-			"\xC5\xB8"		// LATIN CAPITAL LETTER Y WITH DIAERESIS
+		    "\xE2\x82\xAC", // EURO SIGN
+		    "\\x81",        // UNDEFINED
+		    "\xE2\x80\x9A", // SINGLE LOW-9 QUOTATION MARK
+		    "\xC6\x92",     // LATIN SMALL LETTER F WITH HOOK
+		    "\xE2\x80\x9E", // DOUBLE LOW-9 QUOTATION MARK
+		    "\xE2\x80\xA6", // HORIZONTAL ELLIPSIS
+		    "\xE2\x80\xA0", // DAGGER
+		    "\xE2\x80\xA1", // DOUBLE DAGGER
+		    "\xCB\x86",     // MODIFIER LETTER CIRCUMFLEX ACCENT
+		    "\xE2\x80\xB0", // PER MILLE SIGN
+		    "\xC5\xA0",     // LATIN CAPITAL LETTER S WITH CARON
+		    "\xE2\x80\xB9", // SINGLE LEFT-POINTING ANGLE QUOTATION MARK
+		    "\xC5\x92",     // LATIN CAPITAL LIGATURE O
+		    "\\x8d",        // UNDEFINED
+		    "\xC5\xBD",     // LATIN CAPITAL LETTER Z WITH CARON
+		    "\\x8f",        // UNDEFINED
+		    "\\x90",        // UNDEFINED
+		    "\xE2\x80\x98", // LEFT SINGLE QUOTATION MARK
+		    "\xE2\x80\x99", // RIGHT SINGLE QUOTATION MARK
+		    "\xE2\x80\x9C", // LEFT DOUBLE QUOTATION MARK
+		    "\xE2\x80\x9D", // RIGHT DOUBLE QUOTATION MARK
+		    "\xE2\x80\xA2", // BULLET
+		    "\xE2\x80\x93", // EN DASH
+		    "\xE2\x80\x94", // EM DASH
+		    "\xCB\x9C",     // SMALL TILDE
+		    "\xE2\x84\xA2", // TRADE MARK SIGN
+		    "\xC5\xA1",     // LATIN SMALL LETTER S WITH CARON
+		    "\xE2\x80\xBA", // SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+		    "\xC5\x93",     // LATIN SMALL LIGATURE OE
+		    "\\x9d",        // UNDEFINED
+		    "\xC5\xBE",     // LATIN SMALL LETTER Z WITH CARON
+		    "\xC5\xB8"      // LATIN CAPITAL LETTER Y WITH DIAERESIS
 		};
 		const char *str = map[cp - 0x80];
 		size_t len = strlen(str);
@@ -128,16 +129,14 @@ static bool decode_codepoint(uint32_t cp, uint32_t *sz, char *c) {
 }
 
 int64_t strtoll_non_null_terminated(const char *str, const char *end, const char **num_end, int base) {
-	idx_t pos = 0;
-	int64_t result;
-	if (base == 10) {
-		result = duckdb_stable::StringUtil::ToSigned(str, end - str, pos);
-	} else if (base == 16) {
-		result = static_cast<int64_t>(duckdb_stable::StringUtil::FromHex(str, end - str, pos));
-	} else {
-		throw std::runtime_error("Unsupported base");
+	int64_t result = 0;
+	auto [ptr, ec] = std::from_chars(str, end, result, base);
+	if (ec == std::errc::invalid_argument) {
+		throw std::runtime_error("Not a number");
+	} else if (ec == std::errc::result_out_of_range) {
+		throw std::runtime_error("Out of int64 range");
 	}
-	*num_end = str + pos;
+	*num_end = ptr;
 	return result;
 }
 

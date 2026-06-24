@@ -23,7 +23,7 @@
 
 #include <stdint.h>
 #include <string.h>
-#include "inet_html_table.hpp"
+#include "duckdb/inet/inet_html_table.hpp"
 struct INET_HTMLEntity;
 
 #define TOTAL_KEYWORDS  2231

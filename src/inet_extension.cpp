@@ -1,51 +1,43 @@
-#include "duckdb_extension.h"
-#include "inet_html.hpp"
-#include "inet_ipaddress.hpp"
+#include "duckdb/inet/inet_extension.hpp"
 
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <vector>
+#include "duckdb/inet/inet_ipaddress.hpp"
+#include "duckdb/inet/inet_html.hpp"
+#include "duckdb/inet/inet_type.hpp"
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/uhugeint.hpp"
+#include "duckdb/common/vector_operations/generic_executor.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/common/vector_operations/binary_executor.hpp"
+#include "duckdb/function/cast/default_casts.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+
 #include <memory>
+#include <string.h>
 
-#include "duckdb/duckdb_stable.hpp"
-
-// Forward declare vtable
-DUCKDB_EXTENSION_EXTERN
-
-using namespace duckdb_stable;
+namespace duckdb {
 
 //----------------------------------------------------------------------------------------------------------------------
 // INET TYPE DEFINITION
 //----------------------------------------------------------------------------------------------------------------------
-using INET_EXECUTOR_TYPE = StructTypeTernary<PrimitiveType<uint8_t>, PrimitiveType<duckdb_hugeint>, PrimitiveType<uint16_t>>;
-using INET_T = INET_EXECUTOR_TYPE::ARG_TYPE;
+using INET_T = StructTypeTernary<uint8_t, hugeint_t, uint16_t>;
 
-static LogicalType make_inet_type() {
-	const char *child_names[] = {"ip_type", "address", "mask"};
-	std::vector<LogicalType> child_types;
-	child_types.push_back(LogicalType::UTINYINT());
-	child_types.push_back(LogicalType::HUGEINT());
-	child_types.push_back(LogicalType::USMALLINT());
-
-	auto inet_type = LogicalType::STRUCT(child_types.data(), child_names, 3);
-	inet_type.SetAlias("INET");
+LogicalType make_inet_type() {
+	child_list_t<LogicalType> children;
+	children.push_back(make_pair("ip_type", LogicalType::UTINYINT));
+	children.push_back(make_pair("address", LogicalType::HUGEINT));
+	children.push_back(make_pair("mask", LogicalType::USMALLINT));
+	auto inet_type = LogicalType::STRUCT(std::move(children));
+	inet_type.SetAlias(INET_TYPE_NAME);
 	return inet_type;
-}
-
-namespace duckdb_stable {
-
-template<>
-LogicalType TemplateToType::Convert<INET_EXECUTOR_TYPE>() {
-	return make_inet_type();
-}
-
 }
 
 //----------------------------------------------------------------------------------------------------------------------
 // CAST FUNCTIONS
 //----------------------------------------------------------------------------------------------------------------------
-static duckdb_uhugeint from_compatible_address(duckdb_hugeint compat_addr, INET_IPAddressType addr_type) {
+static duckdb_uhugeint from_compatible_address(hugeint_t compat_addr, INET_IPAddressType addr_type) {
 	duckdb_uhugeint retval;
 	memcpy(&retval, &compat_addr, sizeof(duckdb_uhugeint));
 	// Only flip the bit for order on IPv6 addresses. It can never be set in IPv4
@@ -57,7 +49,7 @@ static duckdb_uhugeint from_compatible_address(duckdb_hugeint compat_addr, INET_
 	return retval;
 }
 
-static duckdb_hugeint to_compatible_address(duckdb_uhugeint new_addr, INET_IPAddressType addr_type) {
+static hugeint_t to_compatible_address(duckdb_uhugeint new_addr, INET_IPAddressType addr_type) {
 	if (addr_type == INET_IP_ADDRESS_V6) {
 		// Flip the top bit when storing as a signed hugeint_t so that sorting
 		// works correctly.
@@ -65,8 +57,8 @@ static duckdb_hugeint to_compatible_address(duckdb_uhugeint new_addr, INET_IPAdd
 	}
 	// Don't need to flip the bit for IPv4, and the original IPv4 only
 	// implementation didn't do the flipping, so maintain compatibility.
-	duckdb_hugeint retval;
-	memcpy(&retval, &new_addr, sizeof(duckdb_hugeint));
+	hugeint_t retval;
+	memcpy(&retval, &new_addr, sizeof(hugeint_t));
 	return retval;
 }
 
@@ -160,98 +152,104 @@ static string_t escape_html(string_t input, bool input_quote, HTMLEscapeBuffer &
 	return string_t(result_data, result_size);
 }
 
-struct StringBuffer {
-	char buffer[256];
-};
-
-class INetToVarcharCast : public StandardCastFunctionExt<INetToVarcharCast, INET_EXECUTOR_TYPE, PrimitiveType<string_t>, StringBuffer>  {
-public:
-	int64_t ImplicitCastCost() override {
-		return -1;
-	}
-
-	static TARGET_TYPE::ARG_TYPE Cast(const SOURCE_TYPE::ARG_TYPE &input, STATIC_DATA &data) {
-		auto &buffer = data.buffer;
+static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	StructTypeState<3> state;
+	state.PrepareVector(source);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
+	for (idx_t i = 0; i < count; i++) {
+		auto idx = state.main_data.sel->get_index(i);
+		if (!state.main_data.validity.RowIsValid(idx)) {
+			FlatVector::SetNull(result, i, true);
+			continue;
+		}
+		INET_T input;
+		if (!INET_T::ConstructType(state, i, input)) {
+			FlatVector::SetNull(result, i, true);
+			continue;
+		}
 		INET_IPAddress inet;
 		inet.type = (INET_IPAddressType)input.a_val;
 		inet.address = from_compatible_address(input.b_val, inet.type);
 		inet.mask = input.c_val;
 
+		char buffer[256];
 		size_t written = ipaddress_to_string(&inet, buffer, sizeof(buffer));
-		return string_t(buffer, written);
+		result_data[i] = StringVector::AddString(result, buffer, written);
 	}
-};
+	return true;
+}
 
-class VarcharToINetCast : public StandardCastFunction<VarcharToINetCast, PrimitiveType<string_t>, INET_EXECUTOR_TYPE> {
-public:
-	int64_t ImplicitCastCost() override {
-		return -1;
+static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	UnifiedVectorFormat sdata;
+	source.ToUnifiedFormat(count, sdata);
+	auto strs = UnifiedVectorFormat::GetData<string_t>(sdata);
+	auto &entries = StructVector::GetEntries(result);
+	auto a = FlatVector::GetDataMutable<uint8_t>(entries[0]);
+	auto b = FlatVector::GetDataMutable<hugeint_t>(entries[1]);
+	auto c = FlatVector::GetDataMutable<uint16_t>(entries[2]);
+	for (idx_t i = 0; i < count; i++) {
+		auto idx = sdata.sel->get_index(i);
+		if (!sdata.validity.RowIsValid(idx)) {
+			FlatVector::SetNull(result, i, true);
+			continue;
+		}
+		const auto &input = strs[idx];
+		INET_IPAddress inet = ipaddress_from_string(input.GetData(), input.GetSize());
+		a[i] = (uint8_t)inet.type;
+		b[i] = to_compatible_address(inet.address, inet.type);
+		c[i] = inet.mask;
 	}
+	return true;
+}
 
-	static TARGET_TYPE::ARG_TYPE Cast(const SOURCE_TYPE::ARG_TYPE &input) {
-		auto data = input.GetData();
-		auto size = input.GetSize();
-
-		INET_IPAddress inet = ipaddress_from_string(data, size);
-
-		TARGET_TYPE::ARG_TYPE result;
-		result.a_val = (uint8_t)inet.type;
-		result.b_val = to_compatible_address(inet.address, inet.type);
-		result.c_val = inet.mask;
-		return result;
-	}
-};
-
-class HostFunction : public UnaryFunctionExt<HostFunction, INET_EXECUTOR_TYPE, PrimitiveType<string_t>, StringBuffer> {
-public:
-	const char *Name() const override {
-		return "host";
-	}
-
-	static RESULT_TYPE::ARG_TYPE Operation(const INPUT_TYPE::ARG_TYPE &input, STATIC_DATA &data) {
-		auto &buffer = data.buffer;
+static void HostFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	StructTypeState<3> st;
+	st.PrepareVector(args.data[0]);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
+	char buffer[256];
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto idx = st.main_data.sel->get_index(i);
+		if (!st.main_data.validity.RowIsValid(idx)) {
+			FlatVector::SetNull(result, i, true);
+			continue;
+		}
+		INET_T input;
+		if (!INET_T::ConstructType(st, i, input)) {
+			FlatVector::SetNull(result, i, true);
+			continue;
+		}
 		INET_IPAddress inet;
 		inet.type = (INET_IPAddressType)input.a_val;
 		inet.address = from_compatible_address(input.b_val, inet.type);
 		inet.mask = inet.type == INET_IP_ADDRESS_V4 ? 32 : 128;
 
 		size_t len = ipaddress_to_string(&inet, buffer, sizeof(buffer));
-
 		if (len == 0) {
 			throw std::runtime_error("Could not write inet string");
 		}
 		if (len >= sizeof(buffer)) {
 			throw std::runtime_error("Could not write string");
 		}
-		return string_t(buffer, len);
+		result_data[i] = StringVector::AddString(result, buffer, len);
 	}
-};
+}
 
-class FamilyFunction : public UnaryFunction<FamilyFunction, INET_EXECUTOR_TYPE, PrimitiveType<uint8_t>> {
-public:
-	const char *Name() const override {
-		return "family";
-	}
+static void FamilyFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, PrimitiveType<uint8_t>>(
+	    args.data[0], result, args.size(), [](INET_T input) -> PrimitiveType<uint8_t> {
+		    switch ((INET_IPAddressType)input.a_val) {
+		    case INET_IP_ADDRESS_V4:
+			    return 4;
+		    case INET_IP_ADDRESS_V6:
+			    return 6;
+		    default:
+			    throw std::runtime_error("Invalid IP address type");
+		    }
+	    });
+}
 
-	static RESULT_TYPE::ARG_TYPE Operation(const INPUT_TYPE::ARG_TYPE &input) {
-		switch ((INET_IPAddressType)input.a_val) {
-		case INET_IP_ADDRESS_V4:
-			return 4;
-		break;
-		case INET_IP_ADDRESS_V6:
-			return 6;
-		default:
-			throw std::runtime_error("Invalid IP address type");
-		}
-	}
-};
-
-class NetmaskFunction : public UnaryFunction<NetmaskFunction, INET_EXECUTOR_TYPE, INET_EXECUTOR_TYPE> {
-public:
-	const char *Name() const override {
-		return "netmask";
-	}
-	static RESULT_TYPE::ARG_TYPE Operation(const INPUT_TYPE::ARG_TYPE &input) {
+static void NetmaskFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, INET_T>(args.data[0], result, args.size(), [](INET_T input) -> INET_T {
 		INET_IPAddress old_inet = {};
 		old_inet.type = (INET_IPAddressType)input.a_val;
 		old_inet.address = from_compatible_address(input.b_val, old_inet.type);
@@ -260,20 +258,16 @@ public:
 		// Apply the function
 		INET_IPAddress new_inet = ipaddress_netmask(&old_inet);
 
-		RESULT_TYPE::ARG_TYPE result;
+		INET_T result;
 		result.a_val = (uint8_t)new_inet.type;
 		result.b_val = to_compatible_address(new_inet.address, new_inet.type);
 		result.c_val = new_inet.mask;
 		return result;
-	}
-};
+	});
+}
 
-class NetworkFunction : public UnaryFunction<NetworkFunction, INET_EXECUTOR_TYPE, INET_EXECUTOR_TYPE> {
-public:
-	const char *Name() const override {
-		return "network";
-	}
-	static RESULT_TYPE::ARG_TYPE Operation(const INPUT_TYPE::ARG_TYPE &input) {
+static void NetworkFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, INET_T>(args.data[0], result, args.size(), [](INET_T input) -> INET_T {
 		INET_IPAddress old_inet = {};
 		old_inet.type = (INET_IPAddressType)input.a_val;
 		old_inet.address = from_compatible_address(input.b_val, old_inet.type);
@@ -282,20 +276,16 @@ public:
 		// Apply the function
 		INET_IPAddress new_inet = ipaddress_network(&old_inet);
 
-		RESULT_TYPE::ARG_TYPE result;
+		INET_T result;
 		result.a_val = (uint8_t)new_inet.type;
 		result.b_val = to_compatible_address(new_inet.address, new_inet.type);
 		result.c_val = new_inet.mask;
 		return result;
-	}
-};
+	});
+}
 
-class BroadcastFunction : public UnaryFunction<BroadcastFunction, INET_EXECUTOR_TYPE, INET_EXECUTOR_TYPE> {
-public:
-	const char *Name() const override {
-		return "broadcast";
-	}
-	static RESULT_TYPE::ARG_TYPE Operation(const INPUT_TYPE::ARG_TYPE &input) {
+static void BroadcastFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, INET_T>(args.data[0], result, args.size(), [](INET_T input) -> INET_T {
 		INET_IPAddress old_inet = {};
 		old_inet.type = (INET_IPAddressType)input.a_val;
 		old_inet.address = from_compatible_address(input.b_val, old_inet.type);
@@ -304,28 +294,12 @@ public:
 		// Apply the function
 		INET_IPAddress new_inet = ipaddress_broadcast(&old_inet);
 
-		RESULT_TYPE::ARG_TYPE result;
+		INET_T result;
 		result.a_val = (uint8_t)new_inet.type;
 		result.b_val = to_compatible_address(new_inet.address, new_inet.type);
 		result.c_val = new_inet.mask;
 		return result;
-	}
-};
-
-namespace duckdb_stable {
-
-template<>
-FormatValue FormatValue::CreateFormatValue(INET_T input) {
-	INET_IPAddress inet;
-	inet.type = (INET_IPAddressType)input.a_val;
-	inet.address = from_compatible_address(input.b_val, inet.type);
-	inet.mask = inet.type == INET_IP_ADDRESS_V4 ? 32 : 128;
-
-	char buffer[256];
-	size_t len = ipaddress_to_string(&inet, buffer, sizeof(buffer));
-	return FormatValue(std::string(buffer, len));
-}
-
+	});
 }
 
 static INET_T AddImplementation(const INET_T &lhs, const hugeint_t &rhs) {
@@ -333,51 +307,48 @@ static INET_T AddImplementation(const INET_T &lhs, const hugeint_t &rhs) {
 		return lhs;
 	}
 
-	INET_EXECUTOR_TYPE result;
-	auto addr_type = (INET_IPAddressType) lhs.a_val;
-	uhugeint_t address_in = from_compatible_address(lhs.b_val, addr_type);
+	INET_T result;
+	auto addr_type = (INET_IPAddressType)lhs.a_val;
+	duckdb_uhugeint compat_in = from_compatible_address(lhs.b_val, addr_type);
+	uhugeint_t address_in;
+	address_in.lower = compat_in.lower;
+	address_in.upper = compat_in.upper;
 	uhugeint_t address_out;
 
 	if (rhs > 0) {
-		auto rhs_val = uhugeint_t::from_hugeint(rhs.c_hugeint());
-		address_out = address_in.add(rhs_val);
+		address_out = Uhugeint::Add(address_in, uhugeint_t((uint64_t)rhs.upper, (uint64_t)rhs.lower));
 	} else {
-		auto rhs_val = uhugeint_t::from_hugeint(rhs.negate().c_hugeint());
-		address_out = address_in.subtract(rhs_val);
+		hugeint_t mag = Hugeint::Abs(rhs);
+		address_out = Uhugeint::Subtract(address_in, uhugeint_t((uint64_t)mag.upper, (uint64_t)mag.lower));
 	}
 	if (lhs.a_val == INET_IP_ADDRESS_V4) {
 		// Check if overflow ipv4
-		if (address_out.lower() >= 0xffffffff) {
-			throw OutOfRangeException("Cannot add {} to IPv4 Address {}", rhs, lhs);
+		if (address_out.lower >= 0xffffffff) {
+			throw OutOfRangeException("Cannot add to IPv4 Address: result out of range");
 		}
 	}
 
+	duckdb_uhugeint compat_out;
+	compat_out.lower = address_out.lower;
+	compat_out.upper = address_out.upper;
 	result.a_val = lhs.a_val;
-	result.b_val = to_compatible_address(address_out.c_uhugeint(), addr_type);
+	result.b_val = to_compatible_address(compat_out, addr_type);
 	result.c_val = lhs.c_val;
 	return result;
-
 }
 
-class AddFunction : public BinaryFunction<AddFunction, INET_EXECUTOR_TYPE, PrimitiveType<hugeint_t>, INET_EXECUTOR_TYPE> {
-public:
-	const char *Name() const override {
-		return "+";
-	}
-	static RESULT_TYPE::ARG_TYPE Operation(const A_TYPE::ARG_TYPE &lhs, const B_TYPE::ARG_TYPE &rhs) {
-		return AddImplementation(lhs, rhs);
-	}
-};
+static void AddFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, PrimitiveType<hugeint_t>, INET_T>(
+	    args.data[0], args.data[1], result, args.size(),
+	    [](INET_T lhs, PrimitiveType<hugeint_t> rhs) -> INET_T { return AddImplementation(lhs, rhs.val); });
+}
 
-class SubtractFunction : public BinaryFunction<SubtractFunction, INET_EXECUTOR_TYPE, PrimitiveType<hugeint_t>, INET_EXECUTOR_TYPE> {
-public:
-	const char *Name() const override {
-		return "-";
-	}
-	static RESULT_TYPE::ARG_TYPE Operation(const A_TYPE::ARG_TYPE &lhs, const B_TYPE::ARG_TYPE &rhs) {
-		return AddImplementation(lhs, rhs.negate());
-	}
-};
+static void SubtractFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, PrimitiveType<hugeint_t>, INET_T>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T lhs, PrimitiveType<hugeint_t> rhs) -> INET_T {
+		    return AddImplementation(lhs, Hugeint::Negate(rhs.val));
+	    });
+}
 
 static bool ContainsImplementation(const INET_T &lhs, const INET_T &rhs) {
 	INET_IPAddress lhs_inet;
@@ -405,68 +376,36 @@ static bool ContainsImplementation(const INET_T &lhs, const INET_T &rhs) {
 	return network_in_lower && network_in_upper && broadcast_in_lower && broadcast_in_upper;
 }
 
-class ContainsLeftBaseFunction : public BinaryFunction<ContainsLeftBaseFunction, INET_EXECUTOR_TYPE, INET_EXECUTOR_TYPE, PrimitiveType<bool>> {
-public:
-	static RESULT_TYPE::ARG_TYPE Operation(const A_TYPE::ARG_TYPE &lhs, const B_TYPE::ARG_TYPE &rhs) {
-		return ContainsImplementation(lhs, rhs);
-	}
-};
+static void ContainsLeftFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
+	    args.data[0], args.data[1], result, args.size(),
+	    [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> { return ContainsImplementation(lhs, rhs); });
+}
 
-class ContainsLeftFunction : public ContainsLeftBaseFunction {
-public:
-	const char *Name() const override {
-		return "<<=";
-	}
-};
+static void ContainsRightFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
+	    args.data[0], args.data[1], result, args.size(),
+	    [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> { return ContainsImplementation(rhs, lhs); });
+}
 
-class SubnetContainedByOrEquals : public ContainsLeftBaseFunction {
-public:
-	const char *Name() const override {
-		return "subnet_contained_by_or_equals";
-	}
-};
+static void HtmlEscapeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	HTMLEscapeBuffer buffer;
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t input) {
+		return StringVector::AddString(result, escape_html(input, true, buffer));
+	});
+}
 
-class ContainsRightBaseFunction : public BinaryFunction<ContainsRightBaseFunction, INET_EXECUTOR_TYPE, INET_EXECUTOR_TYPE, PrimitiveType<bool>> {
-public:
-	static RESULT_TYPE::ARG_TYPE Operation(const A_TYPE::ARG_TYPE &lhs, const B_TYPE::ARG_TYPE &rhs) {
-		return ContainsImplementation(rhs, lhs);
-	}
-};
+static void HtmlEscapeQuoteFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	HTMLEscapeBuffer buffer;
+	BinaryExecutor::Execute<string_t, bool, string_t>(
+	    args.data[0], args.data[1], result, args.size(), [&](string_t input, bool input_quote) {
+		    return StringVector::AddString(result, escape_html(input, input_quote, buffer));
+	    });
+}
 
-class ContainsRightFunction : public ContainsRightBaseFunction {
-public:
-	const char *Name() const override {
-		return ">>=";
-	}
-};
-
-class SubnetContainsOrEqualsFunction : public ContainsRightBaseFunction {
-public:
-	const char *Name() const override {
-		return "subnet_contains_or_equals";
-	}
-};
-
-class HTMLEscapeFunction : public UnaryFunctionExt<HTMLEscapeFunction, PrimitiveType<string_t>, PrimitiveType<string_t>, HTMLEscapeBuffer> {
-public:
-	static RESULT_TYPE::ARG_TYPE Operation(const INPUT_TYPE::ARG_TYPE &input, HTMLEscapeBuffer &buffer) {
-		return escape_html(input, true, buffer);
-	}
-};
-
-class HTMLEscapeQuoteFunction : public BinaryFunctionExt<HTMLEscapeQuoteFunction, PrimitiveType<string_t>, PrimitiveType<bool>, PrimitiveType<string_t>, HTMLEscapeBuffer> {
-public:
-	static RESULT_TYPE::ARG_TYPE Operation(const A_TYPE::ARG_TYPE &input, const B_TYPE::ARG_TYPE &input_quote, HTMLEscapeBuffer &buffer) {
-		return escape_html(input, input_quote, buffer);
-	}
-};
-
-class HTMLUnescapeFunction : public UnaryFunctionExt<HTMLUnescapeFunction, PrimitiveType<string_t>, PrimitiveType<string_t>, HTMLEscapeBuffer> {
-public:
-	const char *Name() const override {
-		return "html_unescape";
-	}
-	static RESULT_TYPE::ARG_TYPE Operation(const INPUT_TYPE::ARG_TYPE &input, HTMLEscapeBuffer &buffer) {
+static void HtmlUnescapeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	HTMLEscapeBuffer buffer;
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t input) {
 		auto input_data = input.GetData();
 		auto input_size = input.GetSize();
 
@@ -476,76 +415,62 @@ public:
 		auto result_data = buffer.GetData();
 		inet_html_unescape(input_data, input_size, result_data, result_size);
 
-		return string_t(result_data, result_size);
-	}
-};
-
-class HTMLEscapeSet : public ScalarFunctionSet {
-public:
-	HTMLEscapeSet() : ScalarFunctionSet("html_escape") {
-		HTMLEscapeFunction html_escape;
-		HTMLEscapeQuoteFunction html_quote_escape;
-		AddFunction(html_escape);
-		AddFunction(html_quote_escape);
-	}
-};
+		return StringVector::AddString(result, string_t(result_data, result_size));
+	});
+}
 
 //----------------------------------------------------------------------------------------------------------------------
 // EXTENSION ENTRY
 //----------------------------------------------------------------------------------------------------------------------
-DUCKDB_EXTENSION_CPP_ENTRYPOINT(INET) {
+static void LoadInternal(ExtensionLoader &loader) {
 	auto inet_type = make_inet_type();
-	auto text_type = LogicalType::VARCHAR();
-	auto bool_type = LogicalType::BOOLEAN();
-	auto utinyint_type = LogicalType::UTINYINT();
-	auto hugeint_type = LogicalType::HUGEINT();
-
-	Register(inet_type);
+	loader.RegisterType("INET", inet_type);
 
 	// Register cast functions
-	INetToVarcharCast inet_to_text;
-	Register(inet_to_text);
-
-	VarcharToINetCast text_to_inet;
-	Register(text_to_inet);
+	loader.RegisterCastFunction(inet_type, LogicalType::VARCHAR, BoundCastInfo(InetToVarcharCast));
+	loader.RegisterCastFunction(LogicalType::VARCHAR, inet_type, BoundCastInfo(VarcharToInetCast));
 
 	// scalar functions
-	HostFunction host_function;
-	Register(host_function);
+	loader.RegisterFunction(ScalarFunction("host", {inet_type}, LogicalType::VARCHAR, HostFunction));
+	loader.RegisterFunction(ScalarFunction("family", {inet_type}, LogicalType::UTINYINT, FamilyFunction));
+	loader.RegisterFunction(ScalarFunction("netmask", {inet_type}, inet_type, NetmaskFunction));
+	loader.RegisterFunction(ScalarFunction("network", {inet_type}, inet_type, NetworkFunction));
+	loader.RegisterFunction(ScalarFunction("broadcast", {inet_type}, inet_type, BroadcastFunction));
+	loader.RegisterFunction(ScalarFunction("+", {inet_type, LogicalType::HUGEINT}, inet_type, AddFunction));
+	loader.RegisterFunction(ScalarFunction("-", {inet_type, LogicalType::HUGEINT}, inet_type, SubtractFunction));
+	loader.RegisterFunction(ScalarFunction("<<=", {inet_type, inet_type}, LogicalType::BOOLEAN, ContainsLeftFunction));
+	loader.RegisterFunction(ScalarFunction("subnet_contained_by_or_equals", {inet_type, inet_type},
+	                                       LogicalType::BOOLEAN, ContainsLeftFunction));
+	loader.RegisterFunction(ScalarFunction(">>=", {inet_type, inet_type}, LogicalType::BOOLEAN, ContainsRightFunction));
+	loader.RegisterFunction(ScalarFunction("subnet_contains_or_equals", {inet_type, inet_type}, LogicalType::BOOLEAN,
+	                                       ContainsRightFunction));
 
-	FamilyFunction family_function;
-	Register(family_function);
+	ScalarFunctionSet html_escape("html_escape");
+	html_escape.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, HtmlEscapeFunction));
+	html_escape.AddFunction(
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BOOLEAN}, LogicalType::VARCHAR, HtmlEscapeQuoteFunction));
+	loader.RegisterFunction(html_escape);
+	loader.RegisterFunction(
+	    ScalarFunction("html_unescape", {LogicalType::VARCHAR}, LogicalType::VARCHAR, HtmlUnescapeFunction));
+}
 
-	NetmaskFunction netmask_function;
-	Register(netmask_function);
+void InetExtension::Load(ExtensionLoader &loader) {
+	LoadInternal(loader);
+}
 
-	NetworkFunction network_function;
-	Register(network_function);
+std::string InetExtension::Name() {
+	return "inet";
+}
 
-	BroadcastFunction broadcast_function;
-	Register(broadcast_function);
+std::string InetExtension::Version() const {
+	return "v1.0.0";
+}
 
-	AddFunction add_function;
-	Register(add_function);
+} // namespace duckdb
 
-	SubtractFunction subtract_function;
-	Register(subtract_function);
+extern "C" {
 
-	ContainsLeftFunction contains_left;
-	Register(contains_left);
-
-	SubnetContainedByOrEquals subnet_contained_by_or_equals;
-	Register(subnet_contained_by_or_equals);
-
-	ContainsRightFunction contains_right;
-	Register(contains_right);
-
-	SubnetContainsOrEqualsFunction subnet_contains_or_equals;
-	Register(subnet_contains_or_equals);
-
-	HTMLEscapeSet html_escape_set;
-	Register(html_escape_set);
-
-	HTMLUnescapeFunction html_unescape;
-	Register(html_unescape);
+DUCKDB_CPP_EXTENSION_ENTRY(inet, loader) { // NOLINT
+	duckdb::LoadInternal(loader);
+}
 }
