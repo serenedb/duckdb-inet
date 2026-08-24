@@ -114,13 +114,13 @@ SELECT INET '::ffff:127.0.0.31' + 32;
 statement error
 SELECT INET '::' - 32;
 ----
-Out of Range Error: Overflow in subtraction
+Out of Range Error: Underflow in HUGEINT subtraction
 
 # overflow
 statement error
 SELECT INET 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' - -32;
 ----
-Out of Range Error: Overflow in addition
+Out of Range Error: Overflow in UHUGEINT addition
 
 query I
 SELECT * FROM (VALUES (netmask('2001:db8:3c4d::/48')), (broadcast('2001:db8:3c4d::/48')), (network('2001:db8:3c4d::/32')));

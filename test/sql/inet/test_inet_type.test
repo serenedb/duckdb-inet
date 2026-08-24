@@ -40,57 +40,57 @@ INET
 statement error
 select '127'::inet;
 ----
-^
+Expected an IP address
 
 statement error
 select '127..1'::inet;
 ----
-^
+Expected a number
 
 statement error
 SELECT '256.0.0.1'::INET::VARCHAR
 ----
-^
+Expected a number between 0 and 255
 
 statement error
 SELECT '-1.0.0.1'::INET::VARCHAR
 ----
-^
+Expected a number
 
 statement error
 SELECT '127..0.1'::INET::VARCHAR
 ----
-^
+Expected a number
 
 statement error
 SELECT '127.0.0.1/33'::INET::VARCHAR
 ----
-^
+Expected a number between 0 and 32
 
 statement error
 SELECT '127.0.0.1/333'::INET::VARCHAR
 ----
-^
+Expected a number between 0 and 32
 
 statement error
 SELECT '127.0.0.1/33333333333333333333'::INET::VARCHAR
 ----
-^
+Expected a number between 0 and 32
 
 statement error
 SELECT '3,786'::INET;
 ----
-^
+Expected an IP address
 
 statement error
 SELECT '1.2.3.4#34'::INET
 ----
-^
+Expected a slash
 
 statement error
 SELECT '999.999.999.999/24'::INET
 ----
-^
+Expected a number between 0 and 255
 
 statement ok
 CREATE TABLE inet(ip VARCHAR);

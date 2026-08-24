@@ -102,12 +102,12 @@ SELECT INET '127.0.0.31' - -32;
 statement error
 SELECT INET '0.0.0.0' - 32;
 ----
-Out of Range Error: Overflow in subtraction
+Out of Range Error: Underflow in HUGEINT subtraction
 
 statement error
 select INET '255.255.255.255' + 1
 ----
-Out of Range Error: Cannot add 1
+Out of Range Error: Cannot add to IPv4 Address: result out of range
 
 query I
 SELECT * FROM (VALUES (netmask('10.10.10.1/12')), (broadcast('10.10.10.2/8')), (network('10.10.10.3')));

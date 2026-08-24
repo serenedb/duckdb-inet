@@ -5,6 +5,7 @@
 #include "duckdb/inet/inet_type.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
@@ -187,6 +188,7 @@ static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastP
 	auto a = FlatVector::GetDataMutable<uint8_t>(entries[0]);
 	auto b = FlatVector::GetDataMutable<hugeint_t>(entries[1]);
 	auto c = FlatVector::GetDataMutable<uint16_t>(entries[2]);
+	bool success = true;
 	for (idx_t i = 0; i < count; i++) {
 		auto idx = sdata.sel->get_index(i);
 		if (!sdata.validity.RowIsValid(idx)) {
@@ -194,12 +196,18 @@ static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastP
 			continue;
 		}
 		const auto &input = strs[idx];
-		INET_IPAddress inet = ipaddress_from_string(input.GetData(), input.GetSize());
-		a[i] = (uint8_t)inet.type;
-		b[i] = to_compatible_address(inet.address, inet.type);
-		c[i] = inet.mask;
+		try {
+			INET_IPAddress inet = ipaddress_from_string(input.GetData(), input.GetSize());
+			a[i] = (uint8_t)inet.type;
+			b[i] = to_compatible_address(inet.address, inet.type);
+			c[i] = inet.mask;
+		} catch (const std::exception &ex) {
+			HandleCastError::AssignError(ex.what(), parameters);
+			FlatVector::SetNull(result, i, true);
+			success = false;
+		}
 	}
-	return true;
+	return success;
 }
 
 static void HostFunction(DataChunk &args, ExpressionState &state, Vector &result) {

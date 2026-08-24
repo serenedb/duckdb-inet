@@ -1,7 +1,7 @@
 #include "duckdb/inet/inet_html.hpp"
 #include "duckdb/inet/inet_html_table.hpp"
+#include <fast_float/fast_float.h>
 
-#include <charconv>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -130,11 +130,13 @@ static bool decode_codepoint(uint32_t cp, uint32_t *sz, char *c) {
 
 int64_t strtoll_non_null_terminated(const char *str, const char *end, const char **num_end, int base) {
 	int64_t result = 0;
-	auto [ptr, ec] = std::from_chars(str, end, result, base);
+	auto [ptr, ec] = fast_float::from_chars(str, end, result, base);
 	if (ec == std::errc::invalid_argument) {
-		throw std::runtime_error("Not a number");
+		*num_end = str;
+		return 0;
 	} else if (ec == std::errc::result_out_of_range) {
-		throw std::runtime_error("Out of int64 range");
+		*num_end = ptr;
+		return 0;
 	}
 	*num_end = ptr;
 	return result;
