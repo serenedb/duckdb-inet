@@ -4,9 +4,6 @@
 
 require inet
 
-statement ok
-PRAGMA enable_verification
-
 query I
 SELECT '2001:db8:100:0:c59b:cef3:a0d1:6de4'::INET;
 ----

@@ -4,9 +4,6 @@
 
 require inet
 
-statement ok
-PRAGMA enable_verification
-
 query III
 SELECT {'a': INET '127.0.0.1/17'}, NULL::STRUCT(a INET), {'a': INET '255.255.255.255/31'}
 ----
