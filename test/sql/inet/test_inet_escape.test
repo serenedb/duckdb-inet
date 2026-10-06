@@ -4,9 +4,6 @@
 
 require inet
 
-statement ok
-PRAGMA enable_verification
-
 # html_escape
 query T
 SELECT * FROM (VALUES (html_escape('&')), (html_escape('&#')), (html_escape('&#x')), (html_escape('&#X')), (html_escape('&#y')), (html_escape('&#xy')), (html_escape('&#Xy;'))) tbl(i);
