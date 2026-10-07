@@ -11,9 +11,6 @@ require no_extension_autoloading "FIXME: to be reviewed whether this can be lift
 load __TEST_DIR__/store_inet.db
 
 statement ok
-PRAGMA enable_verification
-
-statement ok
 CREATE TABLE tbl(id INTEGER, i INET);
 
 query IIIIII
