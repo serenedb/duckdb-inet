@@ -14,6 +14,7 @@
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/collation_binding.hpp"
 
 #include <memory>
 #include <string.h>
@@ -357,6 +358,9 @@ static void SubtractFunction(DataChunk &args, ExpressionState &state, Vector &re
 }
 
 static bool ContainsImplementation(const INET_T &lhs, const INET_T &rhs) {
+	if (lhs.a_val != rhs.a_val) {
+		return false;
+	}
 	INET_IPAddress lhs_inet;
 	lhs_inet.type = (INET_IPAddressType)lhs.a_val;
 	lhs_inet.address = from_compatible_address(lhs.b_val, lhs_inet.type);
@@ -392,6 +396,111 @@ static void ContainsRightFunction(DataChunk &args, ExpressionState &state, Vecto
 	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
 	    args.data[0], args.data[1], result, args.size(),
 	    [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> { return ContainsImplementation(rhs, lhs); });
+}
+
+static LogicalType MakeInetSortKeyType() {
+	child_list_t<LogicalType> children;
+	children.push_back(make_pair("ip_type", LogicalType::UTINYINT));
+	children.push_back(make_pair("network", LogicalType::UHUGEINT));
+	children.push_back(make_pair("mask", LogicalType::USMALLINT));
+	children.push_back(make_pair("address", LogicalType::UHUGEINT));
+	return LogicalType::STRUCT(std::move(children));
+}
+
+using INET_SORT_KEY_T = StructTypeQuaternary<uint8_t, uhugeint_t, uint16_t, uhugeint_t>;
+
+static INET_SORT_KEY_T MakeInetSortKey(uint8_t ip_type, hugeint_t compat_address, uint16_t mask) {
+	const auto type = static_cast<INET_IPAddressType>(ip_type);
+	const auto address = from_compatible_address(compat_address, type);
+	const uint32_t max_bits = type == INET_IP_ADDRESS_V6 ? 128 : 32;
+	const uint32_t host_bits = mask >= max_bits ? 0 : max_bits - mask;
+	const auto all_ones = NumericLimits<uint64_t>::Maximum();
+	const uint64_t host_lower = host_bits >= 64 ? all_ones : (uint64_t(1) << host_bits) - 1;
+	const uint64_t host_upper =
+	    host_bits >= 128 ? all_ones : (host_bits > 64 ? (uint64_t(1) << (host_bits - 64)) - 1 : 0);
+	INET_SORT_KEY_T key;
+	key.a_val = ip_type;
+	key.b_val = uhugeint_t(address.upper & ~host_upper, address.lower & ~host_lower);
+	key.c_val = mask;
+	key.d_val = uhugeint_t(address.upper, address.lower);
+	return key;
+}
+
+static bool IsFlatWithoutNulls(const Vector &vector, idx_t count) {
+	return vector.GetVectorType() == VectorType::FLAT_VECTOR && FlatVector::Validity(vector).CheckAllValid(count);
+}
+
+static void InetSortKeyFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	const auto count = args.size();
+	auto &input = args.data[0];
+	if (IsFlatWithoutNulls(input, count)) {
+		const auto &children = StructVector::GetEntries(input);
+		if (IsFlatWithoutNulls(children[0], count) && IsFlatWithoutNulls(children[1], count) &&
+		    IsFlatWithoutNulls(children[2], count)) {
+			const auto ip_type_in = FlatVector::GetData<uint8_t>(children[0]);
+			const auto address_in = FlatVector::GetData<hugeint_t>(children[1]);
+			const auto mask_in = FlatVector::GetData<uint16_t>(children[2]);
+			auto &entries = StructVector::GetEntries(result);
+			auto ip_type_out = FlatVector::GetDataMutable<uint8_t>(entries[0]);
+			auto network_out = FlatVector::GetDataMutable<uhugeint_t>(entries[1]);
+			auto mask_out = FlatVector::GetDataMutable<uint16_t>(entries[2]);
+			auto address_out = FlatVector::GetDataMutable<uhugeint_t>(entries[3]);
+			for (idx_t i = 0; i < count; i++) {
+				const auto key = MakeInetSortKey(ip_type_in[i], address_in[i], mask_in[i]);
+				ip_type_out[i] = key.a_val;
+				network_out[i] = key.b_val;
+				mask_out[i] = key.c_val;
+				address_out[i] = key.d_val;
+			}
+			return;
+		}
+	}
+	auto entries = input.Values<VectorStructType<uint8_t, hugeint_t, uint16_t>>();
+	auto writer = FlatVector::Writer<VectorStructType<uint8_t, uhugeint_t, uint16_t, uhugeint_t>>(result, count);
+	for (const auto entry : entries) {
+		if (!entry.IsValid()) {
+			writer.WriteNull();
+			continue;
+		}
+		const auto ip_type = entry.GetChildValue<0>();
+		const auto address = entry.GetChildValue<1>();
+		const auto mask = entry.GetChildValue<2>();
+		writer.WriteValue([&](auto &ip_type_out, auto &network_out, auto &mask_out, auto &address_out) {
+			if (ip_type.IsValid() && address.IsValid() && mask.IsValid()) {
+				const auto key =
+				    MakeInetSortKey(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
+				ip_type_out.WriteValue(key.a_val);
+				network_out.WriteValue(key.b_val);
+				mask_out.WriteValue(key.c_val);
+				address_out.WriteValue(key.d_val);
+				return;
+			}
+			network_out.WriteNull();
+			if (ip_type.IsValid()) {
+				ip_type_out.WriteValue(ip_type.GetValueUnsafe());
+			} else {
+				ip_type_out.WriteNull();
+			}
+			if (mask.IsValid()) {
+				mask_out.WriteValue(mask.GetValueUnsafe());
+			} else {
+				mask_out.WriteNull();
+			}
+			if (address.IsValid()) {
+				const auto raw = address.GetValueUnsafe();
+				address_out.WriteValue(uhugeint_t(static_cast<uint64_t>(raw.upper), raw.lower));
+			} else {
+				address_out.WriteNull();
+			}
+		});
+	}
+}
+
+static vector<string> GetInetCollationFunctions(ClientContext &, const LogicalType &sql_type, CollationType) {
+	if (sql_type.id() != LogicalTypeId::STRUCT || sql_type.GetAlias() != INET_TYPE_NAME) {
+		return {};
+	}
+	return {"inet_sort_key"};
 }
 
 static void HtmlEscapeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -454,6 +563,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction(">>=", {inet_type, inet_type}, LogicalType::BOOLEAN, ContainsRightFunction));
 	loader.RegisterFunction(ScalarFunction("subnet_contains_or_equals", {inet_type, inet_type}, LogicalType::BOOLEAN,
 	                                       ContainsRightFunction));
+	loader.RegisterFunction(ScalarFunction("inet_sort_key", {inet_type}, MakeInetSortKeyType(), InetSortKeyFunction));
+	CollationBinding::Get(loader.GetDatabaseInstance()).RegisterCollation(CollationCallback(GetInetCollationFunctions));
 
 	ScalarFunctionSet html_escape("html_escape");
 	html_escape.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, HtmlEscapeFunction));

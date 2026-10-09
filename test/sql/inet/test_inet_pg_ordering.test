@@ -1,0 +1,96 @@
+# name: test/sql/inet/test_inet_pg_ordering.test
+# description: INET orders like PostgreSQL in every ordering path
+# group: [inet]
+
+require inet
+
+statement ok
+CREATE TABLE ips(id INTEGER, ip INET);
+
+statement ok
+INSERT INTO ips VALUES (1, '10.0.0.1'), (2, '10.0.0.5/8'), (3, '10.0.0.0/16'), (4, '::1'), (5, NULL);
+
+query I
+SELECT ip FROM ips ORDER BY ip NULLS LAST
+----
+10.0.0.5/8
+10.0.0.0/16
+10.0.0.1
+::1
+NULL
+
+query I
+SELECT id FROM ips WHERE ip BETWEEN '10.0.0.5/8' AND '10.0.0.1' ORDER BY id
+----
+1
+2
+3
+
+query I
+SELECT max(ip, 2) FROM ips
+----
+[::1, 10.0.0.1]
+
+query I
+SELECT min(ip, 2) FROM ips
+----
+[10.0.0.5/8, 10.0.0.0/16]
+
+query II
+SELECT arg_min(id, ip), arg_max(id, ip) FROM ips
+----
+2	4
+
+query I
+SELECT arg_min(id, ip, 2) FROM ips
+----
+[2, 3]
+
+query I
+SELECT greatest('10.0.0.5/8'::INET, '10.0.0.1'::INET, NULL)
+----
+10.0.0.1
+
+query I
+SELECT least(ip, '10.0.0.0/16'::INET) FROM ips ORDER BY id
+----
+10.0.0.0/16
+10.0.0.5/8
+10.0.0.0/16
+10.0.0.0/16
+10.0.0.0/16
+
+query I
+SELECT '10.0.0.0/16'::INET > ANY (SELECT ip FROM ips WHERE family(ip) = 4)
+----
+true
+
+query I
+SELECT '10.0.0.0/16'::INET > ALL (SELECT ip FROM ips WHERE family(ip) = 4 AND id <> 3)
+----
+false
+
+query I
+SELECT {'ip_type': 1, 'address': 5, 'mask': 0}::INET = {'ip_type': 1, 'address': 5, 'mask': 256}::INET
+----
+false
+
+query I
+SELECT ['10.0.0.5/8'::INET, '10.0.0.1'::INET] < ['10.0.0.1'::INET]
+----
+true
+
+query I
+SELECT {'a': '10.0.0.5/8'::INET} < {'a': '10.0.0.1'::INET}
+----
+true
+
+query I
+SELECT '1.2.3.4'::INET <<= '::/0'::INET
+----
+false
+
+query I
+SELECT '::/0'::INET >>= '1.2.3.4'::INET
+----
+false
