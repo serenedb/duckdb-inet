@@ -1,0 +1,44 @@
+# name: test/sql/inet/test_inet_cast_validation.test
+# description: Casts from JSON, VARIANT and ROW to INET validate the value like the STRUCT cast
+# group: [inet]
+
+require inet
+
+require json
+
+statement error
+SELECT '{"ip_type": 3, "address": 5, "mask": 32}'::JSON::INET
+----
+Invalid INET value: ip_type must be 1 (IPv4) or 2 (IPv6)
+
+query III
+SELECT '{"ip_type": 1, "address": null, "mask": 32}'::JSON::INET, ROW(1, NULL, 32)::INET, {'ip_type': 1, 'address': 5, 'mask': NULL}::VARIANT::INET
+----
+NULL	NULL	NULL
+
+statement error
+SELECT {'ip_type': 3, 'address': 5, 'mask': 32}::VARIANT::INET
+----
+Invalid INET value: ip_type must be 1 (IPv4) or 2 (IPv6)
+
+statement error
+SELECT ROW(1, 5, 33)::INET
+----
+Invalid INET value: the IPv4 mask exceeds 32
+
+query IIII
+SELECT '{"ip_type": 1, "address": 5, "mask": 32}'::JSON::INET, {'ip_type': 1, 'address': 5, 'mask': 8}::VARIANT::INET, ROW(1, 5, 24)::INET, '{"ip_type": 2, "address": 1, "mask": 128}'::JSON::INET = {'ip_type': 2, 'address': 1, 'mask': 128}::INET
+----
+0.0.0.5	0.0.0.5/8	0.0.0.5/24	true
+
+query III
+SELECT TRY_CAST('{"ip_type": 3, "address": 5, "mask": 32}'::JSON AS INET), TRY_CAST({'ip_type': 1, 'address': 5, 'mask': 40}::VARIANT AS INET), TRY_CAST(ROW(9, 5, 32) AS INET)
+----
+NULL	NULL	NULL
+
+query I
+SELECT TRY_CAST(j::JSON AS INET) FROM (VALUES ('{"ip_type": 1, "address": 5, "mask": 32}'), ('{"ip_type": 9, "address": 5, "mask": 32}'), (NULL)) t(j)
+----
+0.0.0.5
+NULL
+NULL

@@ -23,6 +23,8 @@ INET_IPAddress ipaddress_from_string(const char *buffer, size_t buffer_size);
 
 // Returns length of string written to buffer. Returns 0 if buffer is too small.
 size_t ipaddress_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer_size);
+size_t cidr_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer_size);
+bool ipaddress_has_host_bits(const INET_IPAddress *ip);
 
 INET_IPAddress ipaddress_netmask(const INET_IPAddress *ip);
 INET_IPAddress ipaddress_network(const INET_IPAddress *ip);

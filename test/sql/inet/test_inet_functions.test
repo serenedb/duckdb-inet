@@ -36,22 +36,22 @@ SELECT netmask(INET '192.168.1.5/32')
 query I
 SELECT netmask(INET '192.168.1.5/24')
 ----
-255.255.255.0/24
+255.255.255.0
 
 query I
 SELECT netmask(INET '192.168.1.5/16')
 ----
-255.255.0.0/16
+255.255.0.0
 
 query I
 SELECT netmask(INET '192.168.1.5/8')
 ----
-255.0.0.0/8
+255.0.0.0
 
 query I
 SELECT netmask(INET '192.168.1.5/0')
 ----
-0.0.0.0/0
+0.0.0.0
 
 # network
 query I
@@ -137,6 +137,6 @@ Out of Range Error: Cannot add to IPv4 Address: result out of range
 query I
 SELECT * FROM (VALUES (netmask('10.10.10.1/12')), (broadcast('10.10.10.2/8')), (network('10.10.10.3')));
 ----
-255.240.0.0/12
+255.240.0.0
 10.255.255.255/8
 10.10.10.3

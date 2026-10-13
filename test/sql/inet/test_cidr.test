@@ -1,0 +1,57 @@
+# name: test/sql/inet/test_cidr.test
+# description: CIDR is an INET without host bits that always prints its netmask
+# group: [inet]
+
+require inet
+
+require json
+
+query IIII
+SELECT '10.1.2.3'::CIDR::VARCHAR, '10.0.0.0/8'::CIDR::VARCHAR, '::1'::CIDR::VARCHAR, '2001:db8::/32'::CIDR::VARCHAR
+----
+10.1.2.3/32	10.0.0.0/8	::1/128	2001:db8::/32
+
+statement error
+SELECT '192.168.1.5/24'::CIDR
+----
+invalid cidr value: "192.168.1.5/24"
+
+statement error
+SELECT '::1/64'::CIDR
+----
+invalid cidr value: "::1/64"
+
+statement error
+SELECT 'garbage'::CIDR
+----
+invalid input syntax for type cidr: "garbage"
+
+query III
+SELECT '192.168.1.5/24'::INET::CIDR::VARCHAR, typeof(network('10.1.2.3/8'::INET)), network('10.0.0.1'::INET)::VARCHAR
+----
+192.168.1.0/24	CIDR	10.0.0.1/32
+
+query IIII
+SELECT typeof(COALESCE('10.0.0.0/8'::CIDR, '1.2.3.4'::INET)), typeof(['10.0.0.0/8'::CIDR, '10.0.0.5/8'::INET]), COALESCE('10.0.0.0/8'::CIDR, '10.0.0.5/8'::INET)::VARCHAR, (SELECT max(x) FROM (SELECT '10.0.0.0/8'::CIDR AS x UNION ALL SELECT '10.0.0.5/8'::INET))::VARCHAR
+----
+INET	INET[]	10.0.0.0/8	10.0.0.5/8
+
+query III
+SELECT '10.0.0.0/16'::CIDR > '10.0.0.5/8'::INET, '10.0.0.0/8'::CIDR >>= '10.1.2.3'::INET, ('10.0.0.0/8'::CIDR + 1)::VARCHAR
+----
+true	true	10.0.0.1/8
+
+statement error
+SELECT {'ip_type': 1, 'address': 5, 'mask': 24}::CIDR
+----
+Invalid CIDR value: bits are set to the right of the mask
+
+query III
+SELECT '{"ip_type": 1, "address": 0, "mask": 24}'::JSON::CIDR::VARCHAR, {'ip_type': 1, 'address': NULL, 'mask': 24}::CIDR, TRY_CAST('10.0.0.1/8' AS CIDR)
+----
+0.0.0.0/24	NULL	NULL
+
+query I
+SELECT list(c::VARCHAR ORDER BY c) FROM (VALUES ('10.0.0.0/16'::CIDR), ('10.0.0.0/8'::CIDR), ('9.0.0.0/8'::CIDR)) t(c)
+----
+[9.0.0.0/8, 10.0.0.0/8, 10.0.0.0/16]

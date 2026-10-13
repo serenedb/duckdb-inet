@@ -100,10 +100,10 @@ SELECT {'ip_type': 3, 'address': 5, 'mask': 32}::INET
 ----
 Invalid INET value: ip_type must be 1 (IPv4) or 2 (IPv6)
 
-statement error
-SELECT {'ip_type': 1, 'address': NULL, 'mask': 32}::INET
+query II
+SELECT {'ip_type': 1, 'address': NULL, 'mask': 32}::INET, {'ip_type': NULL, 'address': 5, 'mask': 32}::INET IS NULL
 ----
-Invalid INET value: its fields can not be NULL
+NULL	true
 
 statement error
 INSERT INTO ips VALUES (6, {'ip_type': 3, 'address': 5, 'mask': 32})
