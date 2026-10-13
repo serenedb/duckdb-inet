@@ -450,6 +450,26 @@ size_t ipaddress_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer
 	}
 }
 
+size_t cidr_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer_size) {
+	size_t pos = ipaddress_to_string(ip, buffer, buffer_size);
+	const size_t full_mask = ip->type == INET_IP_ADDRESS_V4 ? IPV4_DEFAULT_MASK : IPV6_DEFAULT_MASK;
+	if (pos != 0 && ip->mask == full_mask) {
+		pos += snprintf(buffer + pos, buffer_size - pos, "/%u", ip->mask);
+	}
+	return pos;
+}
+
+bool ipaddress_has_host_bits(const INET_IPAddress *ip) {
+	const uint64_t all = ~uint64_t(0);
+	if (ip->type == INET_IP_ADDRESS_V4) {
+		const uint64_t host = ip->mask >= IPV4_DEFAULT_MASK ? 0 : (all >> 32) >> ip->mask;
+		return (ip->address.lower & host) != 0;
+	}
+	const uint64_t host_upper = ip->mask >= 64 ? 0 : all >> ip->mask;
+	const uint64_t host_lower = ip->mask >= IPV6_DEFAULT_MASK ? 0 : (ip->mask <= 64 ? all : all >> (ip->mask - 64));
+	return (ip->address.upper & host_upper) != 0 || (ip->address.lower & host_lower) != 0;
+}
+
 INET_IPAddress ipaddress_netmask(const INET_IPAddress *ip) {
 	duckdb_uhugeint ipv4_mask = {IPV4_NETWORK_MASK, 0};
 	duckdb_uhugeint ip_shift = {ip->mask, 0};
