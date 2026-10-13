@@ -1,0 +1,69 @@
+# name: test/sql/inet/test_inet_json.test
+# description: INET and CIDR become JSON strings of their text, and JSON and VARIANT strings convert back
+# group: [inet]
+
+require inet
+
+require json
+
+query IIII
+SELECT to_json('10.0.0.1'::INET), to_json('2001:db8::1/64'::INET), to_json('10.0.0.0/8'::CIDR), to_json('10.0.0.1/32'::CIDR)
+----
+"10.0.0.1"	"2001:db8::1/64"	"10.0.0.0/8"	"10.0.0.1/32"
+
+query IIII
+SELECT '::1'::INET::JSON, '10.0.0.0/8'::CIDR::JSON, {'a': '10.0.0.1'::INET, 'b': ['::1'::INET, NULL]}::JSON, json_object('k', '10.0.0.0/8'::CIDR, 'v', ['10.0.0.1/24'::INET])
+----
+"::1"	"10.0.0.0/8"	{"a":"10.0.0.1","b":["::1",null]}	{"k":"10.0.0.0/8","v":["10.0.0.1/24"]}
+
+query I
+SELECT to_json(list(ip ORDER BY ip)) FROM (VALUES ('2001:db8::1/64'::INET), ('10.0.0.1'::INET), (NULL)) t(ip)
+----
+["10.0.0.1","2001:db8::1/64",null]
+
+query I
+SELECT json_group_array(ip) FROM (VALUES ('2001:db8::/64'::CIDR)) t(ip)
+----
+["2001:db8::/64"]
+
+query I
+SELECT bool_and(to_json(ip)::INET = ip AND to_json(network(ip))::CIDR = network(ip)) FROM (VALUES ('10.0.0.1'::INET), ('10.1.2.3/24'), ('::1'), ('2001:db8::1/64'), ('ffff::1'), ('0.0.0.0/0')) t(ip)
+----
+true
+
+query IIII
+SELECT '"2001:db8::1/64"'::JSON::INET, ' "10.0.0.0/8"'::JSON::CIDR, '10.0.0.1'::VARIANT::INET, TRY_CAST('"nope"'::JSON AS INET)
+----
+2001:db8::1/64	10.0.0.0/8	10.0.0.1	NULL
+
+query II
+SELECT id, j::JSON::INET FROM (VALUES (1, '"10.0.0.1"'), (2, '{"ip_type": 1, "address": 5, "mask": 32}'), (3, 'null'), (4, NULL), (5, '"::1"')) t(id, j) ORDER BY id
+----
+1	10.0.0.1
+2	0.0.0.5
+3	NULL
+4	NULL
+5	::1
+
+query II
+SELECT id, v::INET FROM (VALUES (1, '10.0.0.1'::VARIANT), (2, {'ip_type': 1, 'address': 5, 'mask': 24}::VARIANT), (3, NULL), (4, '2001:db8::1/64'::VARIANT)) t(id, v) ORDER BY id
+----
+1	10.0.0.1
+2	0.0.0.5/24
+3	NULL
+4	2001:db8::1/64
+
+statement error
+SELECT '"nope"'::JSON::INET
+----
+invalid input syntax for type inet: "nope"
+
+statement error
+SELECT '"10.0.0.1/8"'::JSON::CIDR
+----
+invalid cidr value: "10.0.0.1/8"
+
+statement error
+SELECT '10.0.0.1/8'::VARIANT::CIDR
+----
+invalid cidr value: "10.0.0.1/8"

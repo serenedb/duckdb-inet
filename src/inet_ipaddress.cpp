@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdexcept>
+#include <string>
 
 static const int32_t HEX_BITSIZE = 4;
 static const int32_t MAX_QUIBBLE_DIGITS = 4;
@@ -11,8 +12,6 @@ static const size_t QUIBBLES_PER_HALF = 4;
 static const uint64_t IPV4_NETWORK_MASK = 0xffffffff;
 static const duckdb_uhugeint IPV6_NETWORK_MASK = {0xffffffffffffffff, 0xffffffffffffffff};
 
-static const size_t IPV4_DEFAULT_MASK = 32;
-static const size_t IPV6_DEFAULT_MASK = 128;
 static const size_t IPV6_QUIBBLE_BITS = 16;
 
 #define INET_IPV6_NUM_QUIBBLE (8)
@@ -334,6 +333,54 @@ INET_IPAddress ipaddress_from_string(const char *data, size_t size) {
 	throw std::runtime_error("Expected an IP address");
 }
 
+static uint16_t classful_mask(uint32_t first_octet, size_t octets) {
+	uint16_t bits = first_octet >= 240   ? 32
+	                : first_octet >= 224 ? 8
+	                : first_octet >= 192 ? 24
+	                : first_octet >= 128 ? 16
+	                                     : 8;
+	if (bits < octets * 8) {
+		bits = (uint16_t)(octets * 8);
+	}
+	if (bits == 8 && first_octet == 224) {
+		bits = 4;
+	}
+	return bits;
+}
+
+INET_IPAddress cidr_from_string(const char *data, size_t size) {
+	const std::string text(data, size);
+	const size_t slash = text.find('/');
+	const std::string address = text.substr(0, slash);
+	size_t octets = 1;
+	for (char ch : address) {
+		if (ch == ':') {
+			return ipaddress_from_string(data, size);
+		}
+		octets += ch == '.';
+	}
+	if (address.empty() || octets >= 4) {
+		return ipaddress_from_string(data, size);
+	}
+	std::string expanded = address;
+	for (size_t i = octets; i < 4; i++) {
+		expanded += ".0";
+	}
+	if (slash != std::string::npos) {
+		expanded += text.substr(slash);
+		return ipaddress_from_string(expanded.data(), expanded.size());
+	}
+	uint32_t first_octet = 0;
+	for (size_t i = 0; i < address.size() && address[i] != '.'; i++) {
+		if (!is_digit_char(address[i]) || first_octet > 255) {
+			return ipaddress_from_string(data, size);
+		}
+		first_octet = first_octet * 10 + (uint32_t)(address[i] - '0');
+	}
+	expanded += "/" + std::to_string(classful_mask(first_octet, octets));
+	return ipaddress_from_string(expanded.data(), expanded.size());
+}
+
 static size_t ipadress_to_string_ipv4(const INET_IPAddress *ip, char *buffer, size_t buffer_size) {
 	size_t pos = 0;
 	pos += snprintf(buffer + pos, buffer_size - pos, "%u.%u.%u.%u", (uint32_t)((ip->address.lower >> 24) & 0xff),
@@ -448,6 +495,20 @@ size_t ipaddress_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer
 		// Invalid IP address type
 		return 0;
 	}
+}
+
+size_t cidr_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer_size) {
+	size_t pos = ipaddress_to_string(ip, buffer, buffer_size);
+	const size_t full_mask = ip->type == INET_IP_ADDRESS_V4 ? IPV4_DEFAULT_MASK : IPV6_DEFAULT_MASK;
+	if (pos != 0 && ip->mask == full_mask) {
+		pos += snprintf(buffer + pos, buffer_size - pos, "/%u", ip->mask);
+	}
+	return pos;
+}
+
+bool ipaddress_has_host_bits(const INET_IPAddress *ip) {
+	const duckdb_uhugeint host = ipaddress_host_mask(ip);
+	return ((ip->address.upper & host.upper) | (ip->address.lower & host.lower)) != 0;
 }
 
 INET_IPAddress ipaddress_netmask(const INET_IPAddress *ip) {
