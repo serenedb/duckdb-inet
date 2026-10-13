@@ -262,9 +262,9 @@ static const char *InvalidInetReason(uint8_t ip_type, hugeint_t address, uint16_
 		if (address.upper != 0 || address.lower > NumericLimits<uint32_t>::Maximum()) {
 			return "the IPv4 address is out of range";
 		}
-		return mask > 32 ? "the IPv4 mask exceeds 32" : nullptr;
+		return mask > IPV4_DEFAULT_MASK ? "the IPv4 mask exceeds 32" : nullptr;
 	case INET_IP_ADDRESS_V6:
-		return mask > 128 ? "the IPv6 mask exceeds 128" : nullptr;
+		return mask > IPV6_DEFAULT_MASK ? "the IPv6 mask exceeds 128" : nullptr;
 	default:
 		return "ip_type must be 1 (IPv4) or 2 (IPv6)";
 	}
@@ -395,7 +395,7 @@ static void NetmaskFunction(DataChunk &args, ExpressionState &state, Vector &res
 		INET_T result;
 		result.a_val = (uint8_t)new_inet.type;
 		result.b_val = to_compatible_address(new_inet.address, new_inet.type);
-		result.c_val = new_inet.type == INET_IP_ADDRESS_V4 ? 32 : 128;
+		result.c_val = new_inet.type == INET_IP_ADDRESS_V4 ? IPV4_DEFAULT_MASK : IPV6_DEFAULT_MASK;
 		return result;
 	});
 }
@@ -531,71 +531,86 @@ static void ContainsRightFunction(DataChunk &args, ExpressionState &state, Vecto
 	    [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> { return ContainsImplementation(rhs, lhs); });
 }
 
-static constexpr idx_t INET_SORT_KEY_MAX_SIZE = 35;
+static constexpr idx_t INET_SORT_KEY_V4_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t) + sizeof(uint16_t);
+static constexpr idx_t INET_SORT_KEY_V6_SIZE = sizeof(uint8_t) + 2 * sizeof(uhugeint_t) + sizeof(uint16_t);
+static constexpr idx_t INET_SORT_KEY_MALFORMED_SIZE = 5 * sizeof(uint8_t) + sizeof(uhugeint_t) + sizeof(uint16_t);
 static constexpr data_t INET_SORT_KEY_MALFORMED = 0xFF;
 
+static bool IsInetSortKeyV4(uint8_t ip_type, hugeint_t compat_address) {
+	return ip_type == INET_IP_ADDRESS_V4 && compat_address.upper == 0 &&
+	       compat_address.lower <= NumericLimits<uint32_t>::Maximum();
+}
+
+static idx_t InetSortKeySize(uint8_t ip_type, hugeint_t compat_address) {
+	if (ip_type == INET_IP_ADDRESS_V6) {
+		return INET_SORT_KEY_V6_SIZE;
+	}
+	return IsInetSortKeyV4(ip_type, compat_address) ? INET_SORT_KEY_V4_SIZE : INET_SORT_KEY_MALFORMED_SIZE;
+}
+
 template <class T>
-static void StoreBigEndian(data_ptr_t out, T value) {
+static data_ptr_t AppendBigEndian(data_ptr_t out, T value) {
 	Store<T>(BSwap(value), out);
+	return out + sizeof(T);
 }
 
 static idx_t WriteMalformedInetSortKey(data_ptr_t out, optional_ptr<const uint8_t> ip_type,
                                        optional_ptr<const hugeint_t> address, optional_ptr<const uint16_t> mask) {
-	memset(out, 0, 23);
-	out[0] = INET_SORT_KEY_MALFORMED;
-	if (ip_type) {
-		out[1] = 1;
-		out[2] = *ip_type;
-	}
-	if (address) {
-		out[3] = 1;
-		StoreBigEndian(out + 4, static_cast<uint64_t>(address->upper));
-		StoreBigEndian(out + 12, address->lower);
-	}
-	if (mask) {
-		out[20] = 1;
-		StoreBigEndian(out + 21, *mask);
-	}
-	return 23;
+	auto pos = out;
+	*pos++ = INET_SORT_KEY_MALFORMED;
+	*pos++ = ip_type ? 1 : 0;
+	*pos++ = ip_type ? *ip_type : 0;
+	*pos++ = address ? 1 : 0;
+	pos = AppendBigEndian(pos, address ? static_cast<uint64_t>(address->upper) : uint64_t(0));
+	pos = AppendBigEndian(pos, address ? address->lower : uint64_t(0));
+	*pos++ = mask ? 1 : 0;
+	pos = AppendBigEndian(pos, mask ? *mask : uint16_t(0));
+	return NumericCast<idx_t>(pos - out);
 }
 
 static idx_t WriteInetSortKey(data_ptr_t out, uint8_t ip_type, hugeint_t compat_address, uint16_t mask) {
-	const auto type = static_cast<INET_IPAddressType>(ip_type);
-	const auto address = from_compatible_address(compat_address, type);
-	if (type == INET_IP_ADDRESS_V4 && address.upper == 0 && address.lower <= NumericLimits<uint32_t>::Maximum()) {
-		const auto value = static_cast<uint32_t>(address.lower);
-		const uint32_t host = mask >= 32 ? 0 : NumericLimits<uint32_t>::Maximum() >> mask;
-		out[0] = ip_type;
-		StoreBigEndian(out + 1, value & ~host);
-		StoreBigEndian(out + 5, mask);
-		StoreBigEndian(out + 7, value);
-		return 11;
+	INET_IPAddress inet;
+	inet.type = static_cast<INET_IPAddressType>(ip_type);
+	inet.address = from_compatible_address(compat_address, inet.type);
+	inet.mask = mask;
+	const bool is_v4 = IsInetSortKeyV4(ip_type, compat_address);
+	if (!is_v4 && inet.type != INET_IP_ADDRESS_V6) {
+		return WriteMalformedInetSortKey(out, &ip_type, &compat_address, &mask);
 	}
-	if (type == INET_IP_ADDRESS_V6) {
-		const uint32_t host_bits = mask >= 128 ? 0 : 128 - mask;
-		const auto all_ones = NumericLimits<uint64_t>::Maximum();
-		const uint64_t host_lower = host_bits >= 64 ? all_ones : (uint64_t(1) << host_bits) - 1;
-		const uint64_t host_upper =
-		    host_bits >= 128 ? all_ones : (host_bits > 64 ? (uint64_t(1) << (host_bits - 64)) - 1 : 0);
-		out[0] = ip_type;
-		StoreBigEndian(out + 1, address.upper & ~host_upper);
-		StoreBigEndian(out + 9, address.lower & ~host_lower);
-		StoreBigEndian(out + 17, mask);
-		StoreBigEndian(out + 19, address.upper);
-		StoreBigEndian(out + 27, address.lower);
-		return 35;
+	const auto host = ipaddress_host_mask(&inet);
+	auto pos = out;
+	*pos++ = ip_type;
+	if (is_v4) {
+		const auto address = static_cast<uint32_t>(inet.address.lower);
+		pos = AppendBigEndian(pos, static_cast<uint32_t>(address & ~host.lower));
+		pos = AppendBigEndian(pos, mask);
+		pos = AppendBigEndian(pos, address);
+	} else {
+		pos = AppendBigEndian(pos, inet.address.upper & ~host.upper);
+		pos = AppendBigEndian(pos, inet.address.lower & ~host.lower);
+		pos = AppendBigEndian(pos, mask);
+		pos = AppendBigEndian(pos, inet.address.upper);
+		pos = AppendBigEndian(pos, inet.address.lower);
 	}
-	return WriteMalformedInetSortKey(out, &ip_type, &compat_address, &mask);
+	return NumericCast<idx_t>(pos - out);
 }
 
 static bool IsFlatWithoutNulls(const Vector &vector, idx_t count) {
 	return vector.GetVectorType() == VectorType::FLAT_VECTOR && FlatVector::Validity(vector).CheckAllValid(count);
 }
 
+static void WriteInetSortKey(VectorWriter<string_t> &writer, uint8_t ip_type, hugeint_t compat_address, uint16_t mask) {
+	auto &key = writer.WriteEmptyString(InetSortKeySize(ip_type, compat_address));
+	const auto size = WriteInetSortKey(data_ptr_cast(key.GetDataWriteable()), ip_type, compat_address, mask);
+	D_ASSERT(size == key.GetSize());
+	(void)size;
+	key.Finalize();
+}
+
 static void InetSortKeyFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	const auto count = args.size();
 	auto &input = args.data[0];
-	data_t key[INET_SORT_KEY_MAX_SIZE];
+	auto writer = FlatVector::Writer<string_t>(result, count);
 	if (IsFlatWithoutNulls(input, count)) {
 		const auto &children = StructVector::GetEntries(input);
 		if (IsFlatWithoutNulls(children[INET_IP_TYPE_IDX], count) &&
@@ -604,17 +619,13 @@ static void InetSortKeyFunction(DataChunk &args, ExpressionState &state, Vector 
 			const auto ip_type_in = FlatVector::GetData<uint8_t>(children[INET_IP_TYPE_IDX]);
 			const auto address_in = FlatVector::GetData<hugeint_t>(children[INET_ADDRESS_IDX]);
 			const auto mask_in = FlatVector::GetData<uint16_t>(children[INET_MASK_IDX]);
-			auto result_data = FlatVector::GetDataMutable<string_t>(result);
-			auto &heap = StringVector::GetStringHeap(result);
 			for (idx_t i = 0; i < count; i++) {
-				const auto size = WriteInetSortKey(key, ip_type_in[i], address_in[i], mask_in[i]);
-				result_data[i] = heap.AddBlob(const_char_ptr_cast(key), size);
+				WriteInetSortKey(writer, ip_type_in[i], address_in[i], mask_in[i]);
 			}
 			return;
 		}
 	}
 	auto entries = input.Values<VectorStructType<uint8_t, hugeint_t, uint16_t>>();
-	auto writer = FlatVector::Writer<string_t>(result, count);
 	for (const auto entry : entries) {
 		if (!entry.IsValid()) {
 			writer.WriteNull();
@@ -623,18 +634,17 @@ static void InetSortKeyFunction(DataChunk &args, ExpressionState &state, Vector 
 		const auto ip_type = entry.GetChildValue<INET_IP_TYPE_IDX>();
 		const auto address = entry.GetChildValue<INET_ADDRESS_IDX>();
 		const auto mask = entry.GetChildValue<INET_MASK_IDX>();
-		idx_t size;
 		if (ip_type.IsValid() && address.IsValid() && mask.IsValid()) {
-			size = WriteInetSortKey(key, ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
-		} else {
-			const auto ip_type_value = ip_type.IsValid() ? ip_type.GetValueUnsafe() : uint8_t(0);
-			const auto address_value = address.IsValid() ? address.GetValueUnsafe() : hugeint_t(0);
-			const auto mask_value = mask.IsValid() ? mask.GetValueUnsafe() : uint16_t(0);
-			size = WriteMalformedInetSortKey(key, ip_type.IsValid() ? &ip_type_value : nullptr,
-			                                 address.IsValid() ? &address_value : nullptr,
-			                                 mask.IsValid() ? &mask_value : nullptr);
+			WriteInetSortKey(writer, ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
+			continue;
 		}
-		writer.WriteValue(string_t(const_char_ptr_cast(key), UnsafeNumericCast<uint32_t>(size)));
+		const auto ip_type_value = ip_type.IsValid() ? ip_type.GetValueUnsafe() : uint8_t(0);
+		const auto address_value = address.IsValid() ? address.GetValueUnsafe() : hugeint_t(0);
+		const auto mask_value = mask.IsValid() ? mask.GetValueUnsafe() : uint16_t(0);
+		auto &key = writer.WriteEmptyString(INET_SORT_KEY_MALFORMED_SIZE);
+		WriteMalformedInetSortKey(data_ptr_cast(key.GetDataWriteable()), ip_type.IsValid() ? &ip_type_value : nullptr,
+		                          address.IsValid() ? &address_value : nullptr, mask.IsValid() ? &mask_value : nullptr);
+		key.Finalize();
 	}
 }
 
@@ -652,8 +662,8 @@ static bool CombineInetAndCidr(LogicalTypeResolver &, const LogicalType &, const
 	return true;
 }
 
-static vector<string> GetInetCollationFunctions(ClientContext &, const LogicalType &sql_type, CollationType) {
-	if (sql_type.id() != LogicalTypeId::STRUCT ||
+static vector<string> GetInetCollationFunctions(ClientContext &, const LogicalType &sql_type, CollationType type) {
+	if (type == CollationType::EQUALITY_COLLATIONS || sql_type.id() != LogicalTypeId::STRUCT ||
 	    (sql_type.GetAlias() != INET_TYPE_NAME && sql_type.GetAlias() != CIDR_TYPE_NAME)) {
 		return {};
 	}

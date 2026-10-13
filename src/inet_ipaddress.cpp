@@ -11,8 +11,6 @@ static const size_t QUIBBLES_PER_HALF = 4;
 static const uint64_t IPV4_NETWORK_MASK = 0xffffffff;
 static const duckdb_uhugeint IPV6_NETWORK_MASK = {0xffffffffffffffff, 0xffffffffffffffff};
 
-static const size_t IPV4_DEFAULT_MASK = 32;
-static const size_t IPV6_DEFAULT_MASK = 128;
 static const size_t IPV6_QUIBBLE_BITS = 16;
 
 #define INET_IPV6_NUM_QUIBBLE (8)
@@ -460,14 +458,8 @@ size_t cidr_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer_size
 }
 
 bool ipaddress_has_host_bits(const INET_IPAddress *ip) {
-	const uint64_t all = ~uint64_t(0);
-	if (ip->type == INET_IP_ADDRESS_V4) {
-		const uint64_t host = ip->mask >= IPV4_DEFAULT_MASK ? 0 : (all >> 32) >> ip->mask;
-		return (ip->address.lower & host) != 0;
-	}
-	const uint64_t host_upper = ip->mask >= 64 ? 0 : all >> ip->mask;
-	const uint64_t host_lower = ip->mask >= IPV6_DEFAULT_MASK ? 0 : (ip->mask <= 64 ? all : all >> (ip->mask - 64));
-	return (ip->address.upper & host_upper) != 0 || (ip->address.lower & host_lower) != 0;
+	const duckdb_uhugeint host = ipaddress_host_mask(ip);
+	return ((ip->address.upper & host.upper) | (ip->address.lower & host.lower)) != 0;
 }
 
 INET_IPAddress ipaddress_netmask(const INET_IPAddress *ip) {
