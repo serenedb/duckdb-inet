@@ -4,6 +4,7 @@
 #include "duckdb/inet/inet_html.hpp"
 #include "duckdb/inet/inet_type.hpp"
 
+#include "duckdb/common/bswap.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -14,6 +15,7 @@
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/collation_binding.hpp"
 
 #include <memory>
 #include <string.h>
@@ -25,12 +27,24 @@ namespace duckdb {
 //----------------------------------------------------------------------------------------------------------------------
 using INET_T = StructTypeTernary<uint8_t, hugeint_t, uint16_t>;
 
-LogicalType make_inet_type() {
+static constexpr idx_t INET_IP_TYPE_IDX = 0;
+static constexpr idx_t INET_ADDRESS_IDX = 1;
+static constexpr idx_t INET_MASK_IDX = 2;
+
+static LogicalType make_inet_struct_type() {
 	child_list_t<LogicalType> children;
 	children.push_back(make_pair("ip_type", LogicalType::UTINYINT));
 	children.push_back(make_pair("address", LogicalType::HUGEINT));
 	children.push_back(make_pair("mask", LogicalType::USMALLINT));
-	return LogicalType::STRUCT(std::move(children)).WithAlias(INET_TYPE_NAME);
+	return LogicalType::STRUCT(std::move(children));
+}
+
+LogicalType make_inet_type() {
+	return make_inet_struct_type().WithAlias(INET_TYPE_NAME);
+}
+
+LogicalType make_cidr_type() {
+	return make_inet_struct_type().WithAlias(CIDR_TYPE_NAME);
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -151,6 +165,7 @@ static string_t escape_html(string_t input, bool input_quote, HTMLEscapeBuffer &
 	return string_t(result_data, result_size);
 }
 
+template <bool CIDR>
 static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	StructTypeState<3> state;
 	state.PrepareVector(source);
@@ -172,12 +187,14 @@ static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastP
 		inet.mask = input.c_val;
 
 		char buffer[256];
-		size_t written = ipaddress_to_string(&inet, buffer, sizeof(buffer));
+		size_t written =
+		    CIDR ? cidr_to_string(&inet, buffer, sizeof(buffer)) : ipaddress_to_string(&inet, buffer, sizeof(buffer));
 		result_data[i] = StringVector::AddString(result, buffer, written);
 	}
 	return true;
 }
 
+template <bool CIDR>
 static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	UnifiedVectorFormat sdata;
 	source.ToUnifiedFormat(sdata);
@@ -194,18 +211,129 @@ static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastP
 			continue;
 		}
 		const auto &input = strs[idx];
+		INET_IPAddress inet;
 		try {
-			INET_IPAddress inet = ipaddress_from_string(input.GetData(), input.GetSize());
-			a[i] = (uint8_t)inet.type;
-			b[i] = to_compatible_address(inet.address, inet.type);
-			c[i] = inet.mask;
-		} catch (const std::exception &ex) {
-			HandleCastError::AssignError(ex.what(), parameters);
+			inet = ipaddress_from_string(input.GetData(), input.GetSize());
+		} catch (const std::exception &) {
+			HandleCastError::AssignError(StringUtil::Format("invalid input syntax for type %s: \"%s\"",
+			                                                CIDR ? "cidr" : "inet", input.GetString()),
+			                             parameters);
 			FlatVector::SetNull(result, i, true);
 			success = false;
+			continue;
 		}
+		if (CIDR && ipaddress_has_host_bits(&inet)) {
+			HandleCastError::AssignError(StringUtil::Format("invalid cidr value: \"%s\"", input.GetString()),
+			                             parameters);
+			FlatVector::SetNull(result, i, true);
+			success = false;
+			continue;
+		}
+		a[i] = (uint8_t)inet.type;
+		b[i] = to_compatible_address(inet.address, inet.type);
+		c[i] = inet.mask;
 	}
 	return success;
+}
+
+struct StructToInetCastData : public BoundCastData {
+	explicit StructToInetCastData(BoundCastInfo struct_cast_p) : struct_cast(std::move(struct_cast_p)) {
+	}
+
+	BoundCastInfo struct_cast;
+
+	unique_ptr<BoundCastData> Copy() const override {
+		return make_uniq<StructToInetCastData>(struct_cast.Copy());
+	}
+};
+
+static unique_ptr<FunctionLocalState> InitStructToInetLocalState(CastLocalStateParameters &parameters) {
+	auto &cast_data = parameters.cast_data->Cast<StructToInetCastData>();
+	if (!cast_data.struct_cast.HasInitLocalState()) {
+		return nullptr;
+	}
+	CastLocalStateParameters struct_parameters(parameters, cast_data.struct_cast.GetCastData());
+	return cast_data.struct_cast.InitLocalState(struct_parameters);
+}
+
+static const char *InvalidInetReason(uint8_t ip_type, hugeint_t address, uint16_t mask) {
+	switch (ip_type) {
+	case INET_IP_ADDRESS_V4:
+		if (address.upper != 0 || address.lower > NumericLimits<uint32_t>::Maximum()) {
+			return "the IPv4 address is out of range";
+		}
+		return mask > IPV4_DEFAULT_MASK ? "the IPv4 mask exceeds 32" : nullptr;
+	case INET_IP_ADDRESS_V6:
+		return mask > IPV6_DEFAULT_MASK ? "the IPv6 mask exceeds 128" : nullptr;
+	default:
+		return "ip_type must be 1 (IPv4) or 2 (IPv6)";
+	}
+}
+
+static bool HasHostBits(uint8_t ip_type, hugeint_t address, uint16_t mask) {
+	INET_IPAddress inet;
+	inet.type = static_cast<INET_IPAddressType>(ip_type);
+	inet.address = from_compatible_address(address, inet.type);
+	inet.mask = mask;
+	return ipaddress_has_host_bits(&inet);
+}
+
+template <bool CIDR>
+static bool StructToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	auto &cast_data = parameters.cast_data->Cast<StructToInetCastData>();
+	CastParameters struct_parameters(parameters, cast_data.struct_cast.GetCastData(), parameters.local_state);
+	const auto converted = cast_data.struct_cast.Cast(source, result, count, struct_parameters);
+	const auto is_constant = result.GetVectorType() == VectorType::CONSTANT_VECTOR;
+	bool success = converted;
+	vector<idx_t> null_rows;
+	{
+		auto entries = result.Values<VectorStructType<uint8_t, hugeint_t, uint16_t>>();
+		for (idx_t i = 0; i < (is_constant ? 1 : count); i++) {
+			const auto entry = entries[i];
+			if (!entry.IsValid()) {
+				continue;
+			}
+			const auto ip_type = entry.template GetChildValue<INET_IP_TYPE_IDX>();
+			const auto address = entry.template GetChildValue<INET_ADDRESS_IDX>();
+			const auto mask = entry.template GetChildValue<INET_MASK_IDX>();
+			if (!ip_type.IsValid() || !address.IsValid() || !mask.IsValid()) {
+				null_rows.push_back(i);
+				continue;
+			}
+			auto reason = InvalidInetReason(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
+			if (!reason && CIDR &&
+			    HasHostBits(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe())) {
+				reason = "bits are set to the right of the mask";
+			}
+			if (reason) {
+				HandleCastError::AssignError(StringUtil::Format("Invalid %s value: %s", CIDR ? "CIDR" : "INET", reason),
+				                             parameters);
+				null_rows.push_back(i);
+				success = false;
+			}
+		}
+	}
+	if (null_rows.empty()) {
+		return success;
+	}
+	if (is_constant) {
+		ConstantVector::SetNull(result, true);
+		return success;
+	}
+	for (auto &child : StructVector::GetEntries(result)) {
+		child.Flatten(count);
+	}
+	for (const auto row : null_rows) {
+		FlatVector::SetNull(result, row, true);
+	}
+	return success;
+}
+
+template <bool CIDR>
+static BoundCastInfo BindStructToInetCast(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
+	auto struct_cast = input.GetCastFunction(source, make_inet_struct_type());
+	return BoundCastInfo(StructToInetCast<CIDR>, make_uniq<StructToInetCastData>(std::move(struct_cast)),
+	                     InitStructToInetLocalState);
 }
 
 static void HostFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -267,27 +395,33 @@ static void NetmaskFunction(DataChunk &args, ExpressionState &state, Vector &res
 		INET_T result;
 		result.a_val = (uint8_t)new_inet.type;
 		result.b_val = to_compatible_address(new_inet.address, new_inet.type);
-		result.c_val = new_inet.mask;
+		result.c_val = new_inet.type == INET_IP_ADDRESS_V4 ? IPV4_DEFAULT_MASK : IPV6_DEFAULT_MASK;
 		return result;
 	});
 }
 
+static INET_T NetworkOf(INET_T input) {
+	INET_IPAddress old_inet = {};
+	old_inet.type = (INET_IPAddressType)input.a_val;
+	old_inet.address = from_compatible_address(input.b_val, old_inet.type);
+	old_inet.mask = input.c_val;
+
+	INET_IPAddress new_inet = ipaddress_network(&old_inet);
+
+	INET_T result;
+	result.a_val = (uint8_t)new_inet.type;
+	result.b_val = to_compatible_address(new_inet.address, new_inet.type);
+	result.c_val = new_inet.mask;
+	return result;
+}
+
 static void NetworkFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	GenericExecutor::ExecuteUnary<INET_T, INET_T>(args.data[0], result, args.size(), [](INET_T input) -> INET_T {
-		INET_IPAddress old_inet = {};
-		old_inet.type = (INET_IPAddressType)input.a_val;
-		old_inet.address = from_compatible_address(input.b_val, old_inet.type);
-		old_inet.mask = input.c_val;
+	GenericExecutor::ExecuteUnary<INET_T, INET_T>(args.data[0], result, args.size(), NetworkOf);
+}
 
-		// Apply the function
-		INET_IPAddress new_inet = ipaddress_network(&old_inet);
-
-		INET_T result;
-		result.a_val = (uint8_t)new_inet.type;
-		result.b_val = to_compatible_address(new_inet.address, new_inet.type);
-		result.c_val = new_inet.mask;
-		return result;
-	});
+static bool InetToCidrCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	GenericExecutor::ExecuteUnary<INET_T, INET_T>(source, result, count, NetworkOf);
+	return true;
 }
 
 static void BroadcastFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -357,6 +491,9 @@ static void SubtractFunction(DataChunk &args, ExpressionState &state, Vector &re
 }
 
 static bool ContainsImplementation(const INET_T &lhs, const INET_T &rhs) {
+	if (lhs.a_val != rhs.a_val) {
+		return false;
+	}
 	INET_IPAddress lhs_inet;
 	lhs_inet.type = (INET_IPAddressType)lhs.a_val;
 	lhs_inet.address = from_compatible_address(lhs.b_val, lhs_inet.type);
@@ -392,6 +529,145 @@ static void ContainsRightFunction(DataChunk &args, ExpressionState &state, Vecto
 	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
 	    args.data[0], args.data[1], result, args.size(),
 	    [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> { return ContainsImplementation(rhs, lhs); });
+}
+
+static constexpr idx_t INET_SORT_KEY_V4_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t) + sizeof(uint16_t);
+static constexpr idx_t INET_SORT_KEY_V6_SIZE = sizeof(uint8_t) + 2 * sizeof(uhugeint_t) + sizeof(uint16_t);
+static constexpr idx_t INET_SORT_KEY_MALFORMED_SIZE = 5 * sizeof(uint8_t) + sizeof(uhugeint_t) + sizeof(uint16_t);
+static constexpr data_t INET_SORT_KEY_MALFORMED = 0xFF;
+
+static bool IsInetSortKeyV4(uint8_t ip_type, hugeint_t compat_address) {
+	return ip_type == INET_IP_ADDRESS_V4 && compat_address.upper == 0 &&
+	       compat_address.lower <= NumericLimits<uint32_t>::Maximum();
+}
+
+static idx_t InetSortKeySize(uint8_t ip_type, hugeint_t compat_address) {
+	if (ip_type == INET_IP_ADDRESS_V6) {
+		return INET_SORT_KEY_V6_SIZE;
+	}
+	return IsInetSortKeyV4(ip_type, compat_address) ? INET_SORT_KEY_V4_SIZE : INET_SORT_KEY_MALFORMED_SIZE;
+}
+
+template <class T>
+static data_ptr_t AppendBigEndian(data_ptr_t out, T value) {
+	Store<T>(BSwap(value), out);
+	return out + sizeof(T);
+}
+
+static idx_t WriteMalformedInetSortKey(data_ptr_t out, optional_ptr<const uint8_t> ip_type,
+                                       optional_ptr<const hugeint_t> address, optional_ptr<const uint16_t> mask) {
+	auto pos = out;
+	*pos++ = INET_SORT_KEY_MALFORMED;
+	*pos++ = ip_type ? 1 : 0;
+	*pos++ = ip_type ? *ip_type : 0;
+	*pos++ = address ? 1 : 0;
+	pos = AppendBigEndian(pos, address ? static_cast<uint64_t>(address->upper) : uint64_t(0));
+	pos = AppendBigEndian(pos, address ? address->lower : uint64_t(0));
+	*pos++ = mask ? 1 : 0;
+	pos = AppendBigEndian(pos, mask ? *mask : uint16_t(0));
+	return NumericCast<idx_t>(pos - out);
+}
+
+static idx_t WriteInetSortKey(data_ptr_t out, uint8_t ip_type, hugeint_t compat_address, uint16_t mask) {
+	INET_IPAddress inet;
+	inet.type = static_cast<INET_IPAddressType>(ip_type);
+	inet.address = from_compatible_address(compat_address, inet.type);
+	inet.mask = mask;
+	const bool is_v4 = IsInetSortKeyV4(ip_type, compat_address);
+	if (!is_v4 && inet.type != INET_IP_ADDRESS_V6) {
+		return WriteMalformedInetSortKey(out, &ip_type, &compat_address, &mask);
+	}
+	const auto host = ipaddress_host_mask(&inet);
+	auto pos = out;
+	*pos++ = ip_type;
+	if (is_v4) {
+		const auto address = static_cast<uint32_t>(inet.address.lower);
+		pos = AppendBigEndian(pos, static_cast<uint32_t>(address & ~host.lower));
+		pos = AppendBigEndian(pos, mask);
+		pos = AppendBigEndian(pos, address);
+	} else {
+		pos = AppendBigEndian(pos, inet.address.upper & ~host.upper);
+		pos = AppendBigEndian(pos, inet.address.lower & ~host.lower);
+		pos = AppendBigEndian(pos, mask);
+		pos = AppendBigEndian(pos, inet.address.upper);
+		pos = AppendBigEndian(pos, inet.address.lower);
+	}
+	return NumericCast<idx_t>(pos - out);
+}
+
+static bool IsFlatWithoutNulls(const Vector &vector, idx_t count) {
+	return vector.GetVectorType() == VectorType::FLAT_VECTOR && FlatVector::Validity(vector).CheckAllValid(count);
+}
+
+static void WriteInetSortKey(VectorWriter<string_t> &writer, uint8_t ip_type, hugeint_t compat_address, uint16_t mask) {
+	auto &key = writer.WriteEmptyString(InetSortKeySize(ip_type, compat_address));
+	const auto size = WriteInetSortKey(data_ptr_cast(key.GetDataWriteable()), ip_type, compat_address, mask);
+	D_ASSERT(size == key.GetSize());
+	(void)size;
+	key.Finalize();
+}
+
+static void InetSortKeyFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	const auto count = args.size();
+	auto &input = args.data[0];
+	auto writer = FlatVector::Writer<string_t>(result, count);
+	if (IsFlatWithoutNulls(input, count)) {
+		const auto &children = StructVector::GetEntries(input);
+		if (IsFlatWithoutNulls(children[INET_IP_TYPE_IDX], count) &&
+		    IsFlatWithoutNulls(children[INET_ADDRESS_IDX], count) &&
+		    IsFlatWithoutNulls(children[INET_MASK_IDX], count)) {
+			const auto ip_type_in = FlatVector::GetData<uint8_t>(children[INET_IP_TYPE_IDX]);
+			const auto address_in = FlatVector::GetData<hugeint_t>(children[INET_ADDRESS_IDX]);
+			const auto mask_in = FlatVector::GetData<uint16_t>(children[INET_MASK_IDX]);
+			for (idx_t i = 0; i < count; i++) {
+				WriteInetSortKey(writer, ip_type_in[i], address_in[i], mask_in[i]);
+			}
+			return;
+		}
+	}
+	auto entries = input.Values<VectorStructType<uint8_t, hugeint_t, uint16_t>>();
+	for (const auto entry : entries) {
+		if (!entry.IsValid()) {
+			writer.WriteNull();
+			continue;
+		}
+		const auto ip_type = entry.GetChildValue<INET_IP_TYPE_IDX>();
+		const auto address = entry.GetChildValue<INET_ADDRESS_IDX>();
+		const auto mask = entry.GetChildValue<INET_MASK_IDX>();
+		if (ip_type.IsValid() && address.IsValid() && mask.IsValid()) {
+			WriteInetSortKey(writer, ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
+			continue;
+		}
+		const auto ip_type_value = ip_type.IsValid() ? ip_type.GetValueUnsafe() : uint8_t(0);
+		const auto address_value = address.IsValid() ? address.GetValueUnsafe() : hugeint_t(0);
+		const auto mask_value = mask.IsValid() ? mask.GetValueUnsafe() : uint16_t(0);
+		auto &key = writer.WriteEmptyString(INET_SORT_KEY_MALFORMED_SIZE);
+		WriteMalformedInetSortKey(data_ptr_cast(key.GetDataWriteable()), ip_type.IsValid() ? &ip_type_value : nullptr,
+		                          address.IsValid() ? &address_value : nullptr, mask.IsValid() ? &mask_value : nullptr);
+		key.Finalize();
+	}
+}
+
+static bool HasInetAlias(const LogicalType &type, const char *alias) {
+	return type.id() == LogicalTypeId::STRUCT && type.GetAlias() == alias;
+}
+
+static bool MatchesInetAndCidr(const LogicalType &left, const LogicalType &right) {
+	return (HasInetAlias(left, INET_TYPE_NAME) && HasInetAlias(right, CIDR_TYPE_NAME)) ||
+	       (HasInetAlias(left, CIDR_TYPE_NAME) && HasInetAlias(right, INET_TYPE_NAME));
+}
+
+static bool CombineInetAndCidr(LogicalTypeResolver &, const LogicalType &, const LogicalType &, LogicalType &result) {
+	result = make_inet_type();
+	return true;
+}
+
+static vector<string> GetInetCollationFunctions(ClientContext &, const LogicalType &sql_type, CollationType type) {
+	if (type == CollationType::EQUALITY_COLLATIONS || sql_type.id() != LogicalTypeId::STRUCT ||
+	    (sql_type.GetAlias() != INET_TYPE_NAME && sql_type.GetAlias() != CIDR_TYPE_NAME)) {
+		return {};
+	}
+	return {"inet_sort_key"};
 }
 
 static void HtmlEscapeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -431,16 +707,28 @@ static void HtmlUnescapeFunction(DataChunk &args, ExpressionState &state, Vector
 static void LoadInternal(ExtensionLoader &loader) {
 	auto inet_type = make_inet_type();
 	loader.RegisterType("INET", inet_type);
+	auto cidr_type = make_cidr_type();
+	loader.RegisterType("CIDR", cidr_type);
 
 	// Register cast functions
-	loader.RegisterCastFunction(inet_type, LogicalType::VARCHAR, BoundCastInfo(InetToVarcharCast));
-	loader.RegisterCastFunction(LogicalType::VARCHAR, inet_type, BoundCastInfo(VarcharToInetCast));
+	loader.RegisterCastFunction(inet_type, LogicalType::VARCHAR, BoundCastInfo(InetToVarcharCast<false>));
+	loader.RegisterCastFunction(LogicalType::VARCHAR, inet_type, BoundCastInfo(VarcharToInetCast<false>));
+	loader.RegisterCastFunction(cidr_type, LogicalType::VARCHAR, BoundCastInfo(InetToVarcharCast<true>));
+	loader.RegisterCastFunction(LogicalType::VARCHAR, cidr_type, BoundCastInfo(VarcharToInetCast<true>));
+	loader.RegisterCastFunction(cidr_type, inet_type, DefaultCasts::ReinterpretCast, 1);
+	loader.RegisterCastFunction(inet_type, cidr_type, BoundCastInfo(InetToCidrCast));
+	loader.RegisterCombineTypesRule(CombineTypesRule {MatchesInetAndCidr, CombineInetAndCidr});
+	for (const auto &source : {LogicalType::STRUCT({{"any", LogicalType::ANY}}), LogicalType::TUPLE({LogicalType::ANY}),
+	                           LogicalType::JSON(), LogicalType::VARIANT()}) {
+		loader.RegisterCastFunction(source, inet_type, BindStructToInetCast<false>);
+		loader.RegisterCastFunction(source, cidr_type, BindStructToInetCast<true>);
+	}
 
 	// scalar functions
 	loader.RegisterFunction(ScalarFunction("host", {inet_type}, LogicalType::VARCHAR, HostFunction));
 	loader.RegisterFunction(ScalarFunction("family", {inet_type}, LogicalType::UTINYINT, FamilyFunction));
 	loader.RegisterFunction(ScalarFunction("netmask", {inet_type}, inet_type, NetmaskFunction));
-	loader.RegisterFunction(ScalarFunction("network", {inet_type}, inet_type, NetworkFunction));
+	loader.RegisterFunction(ScalarFunction("network", {inet_type}, cidr_type, NetworkFunction));
 	loader.RegisterFunction(ScalarFunction("broadcast", {inet_type}, inet_type, BroadcastFunction));
 	ScalarFunction add_fun("+", {inet_type, LogicalType::HUGEINT}, inet_type, AddFunction);
 	add_fun.SetFallible();
@@ -454,6 +742,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction(">>=", {inet_type, inet_type}, LogicalType::BOOLEAN, ContainsRightFunction));
 	loader.RegisterFunction(ScalarFunction("subnet_contains_or_equals", {inet_type, inet_type}, LogicalType::BOOLEAN,
 	                                       ContainsRightFunction));
+	loader.RegisterFunction(ScalarFunction("inet_sort_key", {inet_type}, LogicalType::BLOB, InetSortKeyFunction));
+	CollationBinding::Get(loader.GetDatabaseInstance()).RegisterCollation(CollationCallback(GetInetCollationFunctions));
 
 	ScalarFunctionSet html_escape("html_escape");
 	html_escape.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, HtmlEscapeFunction));

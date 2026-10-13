@@ -1,0 +1,193 @@
+# name: test/sql/inet/test_inet_pg_ordering.test
+# description: INET orders like PostgreSQL in every ordering path
+# group: [inet]
+
+require inet
+
+statement ok
+CREATE TABLE ips(id INTEGER, ip INET);
+
+statement ok
+INSERT INTO ips VALUES (1, '10.0.0.1'), (2, '10.0.0.5/8'), (3, '10.0.0.0/16'), (4, '::1'), (5, NULL);
+
+query I
+SELECT ip FROM ips ORDER BY ip NULLS LAST
+----
+10.0.0.5/8
+10.0.0.0/16
+10.0.0.1
+::1
+NULL
+
+query I
+SELECT id FROM ips WHERE ip BETWEEN '10.0.0.5/8' AND '10.0.0.1' ORDER BY id
+----
+1
+2
+3
+
+query I
+SELECT max(ip, 2) FROM ips
+----
+[::1, 10.0.0.1]
+
+query I
+SELECT min(ip, 2) FROM ips
+----
+[10.0.0.5/8, 10.0.0.0/16]
+
+query II
+SELECT arg_min(id, ip), arg_max(id, ip) FROM ips
+----
+2	4
+
+query I
+SELECT arg_min(id, ip, 2) FROM ips
+----
+[2, 3]
+
+query I
+SELECT greatest('10.0.0.5/8'::INET, '10.0.0.1'::INET, NULL)
+----
+10.0.0.1
+
+query I
+SELECT least(ip, '10.0.0.0/16'::INET) FROM ips ORDER BY id
+----
+10.0.0.0/16
+10.0.0.5/8
+10.0.0.0/16
+10.0.0.0/16
+10.0.0.0/16
+
+query I
+SELECT '10.0.0.0/16'::INET > ANY (SELECT ip FROM ips WHERE family(ip) = 4)
+----
+true
+
+query I
+SELECT '10.0.0.0/16'::INET > ALL (SELECT ip FROM ips WHERE family(ip) = 4 AND id <> 3)
+----
+false
+
+query II
+SELECT '10.0.0.1'::INET > ANY (SELECT v FROM (VALUES ('9.0.0.0'), ('11.0.0.0')) t(v)), '10.0.0.5/8'::INET < ALL (SELECT v FROM (VALUES ('10.0.0.1'), ('10.0.0.0/16')) t(v))
+----
+true	true
+
+query I
+SELECT {'ip_type': 1, 'address': 5, 'mask': 0}::INET < {'ip_type': 1, 'address': 5, 'mask': 32}::INET
+----
+true
+
+statement error
+SELECT {'ip_type': 1, 'address': 5, 'mask': 256}::INET
+----
+Invalid INET value: the IPv4 mask exceeds 32
+
+statement error
+SELECT {'ip_type': 2, 'address': 5, 'mask': 129}::INET
+----
+Invalid INET value: the IPv6 mask exceeds 128
+
+statement error
+SELECT {'ip_type': 1, 'address': 4294967296, 'mask': 32}::INET
+----
+Invalid INET value: the IPv4 address is out of range
+
+statement error
+SELECT {'ip_type': 3, 'address': 5, 'mask': 32}::INET
+----
+Invalid INET value: ip_type must be 1 (IPv4) or 2 (IPv6)
+
+query II
+SELECT {'ip_type': 1, 'address': NULL, 'mask': 32}::INET, {'ip_type': NULL, 'address': 5, 'mask': 32}::INET IS NULL
+----
+NULL	true
+
+statement error
+INSERT INTO ips VALUES (6, {'ip_type': 3, 'address': 5, 'mask': 32})
+----
+Invalid INET value
+
+query II
+SELECT TRY_CAST({'ip_type': 3, 'address': 5, 'mask': 32} AS INET), TRY_CAST({'ip_type': 1, 'address': 5, 'mask': 32} AS INET)
+----
+NULL	0.0.0.5
+
+query I
+SELECT CAST(NULL::STRUCT(ip_type UTINYINT, address HUGEINT, mask USMALLINT) AS INET)
+----
+NULL
+
+query I
+SELECT TRY_CAST(s AS INET) FROM (VALUES ({'ip_type': 1, 'address': 5, 'mask': 32}), ({'ip_type': 9, 'address': 5, 'mask': 32}), (NULL)) t(s)
+----
+0.0.0.5
+NULL
+NULL
+
+query II
+SELECT list_min([ip for ip in ['10.0.0.1', '10.0.0.5/8', NULL, '10.0.0.0/16']::INET[]]), list_max(['10.0.0.5/8'::INET, '10.0.0.1'::INET])
+----
+10.0.0.5/8	10.0.0.1
+
+query I
+SELECT list_aggregate(['10.0.0.1'::INET, '10.0.0.5/8'::INET, '10.0.0.0/16'::INET], 'max', 2)
+----
+[10.0.0.1, 10.0.0.0/16]
+
+query II
+SELECT list_min(l), list_max(l) FROM (SELECT list(ip) l FROM ips)
+----
+10.0.0.5/8	::1
+
+query I
+SELECT greatest(ARRAY['10.0.0.5/8'::INET], ARRAY['10.0.0.1'::INET])
+----
+[10.0.0.1]
+
+query I
+SELECT least({'a': '10.0.0.1'::INET}, {'a': '10.0.0.5/8'::INET}, NULL)
+----
+{'a': 10.0.0.5/8}
+
+query I
+SELECT arg_max(id, [ip]) FROM ips WHERE family(ip) = 4
+----
+1
+
+query I
+SELECT max([ip], 2) FROM ips WHERE family(ip) = 4
+----
+[[10.0.0.1], [10.0.0.0/16]]
+
+query I
+SELECT {'a': '10.0.0.0/16'::INET} > ANY (SELECT {'a': ip} FROM ips WHERE family(ip) = 4)
+----
+true
+
+query I
+SELECT ['10.0.0.0/16'::INET] > ALL (SELECT [ip] FROM ips WHERE family(ip) = 4 AND id <> 3)
+----
+false
+
+query I
+SELECT ['10.0.0.5/8'::INET, '10.0.0.1'::INET] < ['10.0.0.1'::INET]
+----
+true
+
+query I
+SELECT {'a': '10.0.0.5/8'::INET} < {'a': '10.0.0.1'::INET}
+----
+true
+
+query I
+SELECT '1.2.3.4'::INET <<= '::/0'::INET
+----
+false
+
+query I
+SELECT '::/0'::INET >>= '1.2.3.4'::INET
+----
+false
