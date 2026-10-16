@@ -4,6 +4,7 @@
 #include "duckdb/inet/inet_html.hpp"
 #include "duckdb/inet/inet_type.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/bswap.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
@@ -14,6 +15,8 @@
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/collation_binding.hpp"
 
@@ -165,7 +168,7 @@ static string_t escape_html(string_t input, bool input_quote, HTMLEscapeBuffer &
 	return string_t(result_data, result_size);
 }
 
-template <bool CIDR>
+template <bool WITH_MASK>
 static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	StructTypeState<3> state;
 	state.PrepareVector(source);
@@ -187,11 +190,22 @@ static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastP
 		inet.mask = input.c_val;
 
 		char buffer[256];
-		size_t written =
-		    CIDR ? cidr_to_string(&inet, buffer, sizeof(buffer)) : ipaddress_to_string(&inet, buffer, sizeof(buffer));
+		size_t written = WITH_MASK ? cidr_to_string(&inet, buffer, sizeof(buffer))
+		                           : ipaddress_to_string(&inet, buffer, sizeof(buffer));
 		result_data[i] = StringVector::AddString(result, buffer, written);
 	}
 	return true;
+}
+
+static BoundCastInfo BindInetToVarchar(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
+	if (input.context) {
+		auto &context = *input.context;
+		auto db = DatabaseManager::Get(context).GetDatabase(DatabaseManager::TryGetDefaultDatabase(context));
+		if (db && db->GetCatalog().Compatibility() == SqlCompatibility::POSTGRES) {
+			return BoundCastInfo(InetToVarcharCast<true>);
+		}
+	}
+	return BoundCastInfo(InetToVarcharCast<false>);
 }
 
 template <bool CIDR>
@@ -772,7 +786,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterType("CIDR", cidr_type);
 
 	// Register cast functions
-	loader.RegisterCastFunction(inet_type, LogicalType::VARCHAR, BoundCastInfo(InetToVarcharCast<false>));
+	loader.RegisterCastFunction(inet_type, LogicalType::VARCHAR, BindInetToVarchar);
 	loader.RegisterCastFunction(LogicalType::VARCHAR, inet_type, BoundCastInfo(VarcharToInetCast<false>));
 	loader.RegisterCastFunction(cidr_type, LogicalType::VARCHAR, BoundCastInfo(InetToVarcharCast<true>));
 	loader.RegisterCastFunction(LogicalType::VARCHAR, cidr_type, BoundCastInfo(VarcharToInetCast<true>));
