@@ -4,6 +4,7 @@
 #include "duckdb/inet/inet_html.hpp"
 #include "duckdb/inet/inet_type.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -13,10 +14,14 @@
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include <charconv>
 #include <memory>
 #include <string.h>
+#include <string_view>
 
 namespace duckdb {
 
@@ -151,6 +156,7 @@ static string_t escape_html(string_t input, bool input_quote, HTMLEscapeBuffer &
 	return string_t(result_data, result_size);
 }
 
+template <bool WITH_MASK>
 static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	StructTypeState<3> state;
 	state.PrepareVector(source);
@@ -173,9 +179,24 @@ static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastP
 
 		char buffer[256];
 		size_t written = ipaddress_to_string(&inet, buffer, sizeof(buffer));
+		if (WITH_MASK && !std::string_view(buffer, written).contains('/')) {
+			buffer[written++] = '/';
+			written = std::to_chars(buffer + written, buffer + sizeof(buffer), inet.mask).ptr - buffer;
+		}
 		result_data[i] = StringVector::AddString(result, buffer, written);
 	}
 	return true;
+}
+
+static BoundCastInfo BindInetToVarchar(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
+	if (input.context) {
+		auto &context = *input.context;
+		auto db = DatabaseManager::Get(context).GetDatabase(DatabaseManager::TryGetDefaultDatabase(context));
+		if (db && db->GetCatalog().Compatibility() == SqlCompatibility::POSTGRES) {
+			return BoundCastInfo(InetToVarcharCast<true>);
+		}
+	}
+	return BoundCastInfo(InetToVarcharCast<false>);
 }
 
 static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
@@ -433,7 +454,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterType("INET", inet_type);
 
 	// Register cast functions
-	loader.RegisterCastFunction(inet_type, LogicalType::VARCHAR, BoundCastInfo(InetToVarcharCast));
+	loader.RegisterCastFunction(inet_type, LogicalType::VARCHAR, BindInetToVarchar);
 	loader.RegisterCastFunction(LogicalType::VARCHAR, inet_type, BoundCastInfo(VarcharToInetCast));
 
 	// scalar functions
