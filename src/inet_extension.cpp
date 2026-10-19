@@ -606,8 +606,6 @@ static void BitwiseBinaryFunction(DataChunk &args, ExpressionState &state, Vecto
 	    });
 }
 
-static constexpr idx_t INET_SORT_KEY_V4_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t) + sizeof(uint16_t);
-static constexpr idx_t INET_SORT_KEY_V6_SIZE = sizeof(uint8_t) + 2 * sizeof(uhugeint_t) + sizeof(uint16_t);
 static constexpr idx_t INET_SORT_KEY_MALFORMED_SIZE = 5 * sizeof(uint8_t) + sizeof(uhugeint_t) + sizeof(uint16_t);
 static constexpr data_t INET_SORT_KEY_MALFORMED = 0xFF;
 
