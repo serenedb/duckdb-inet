@@ -42,3 +42,22 @@ SELECT TRY_CAST(j::JSON AS INET) FROM (VALUES ('{"ip_type": 1, "address": 5, "ma
 0.0.0.5
 NULL
 NULL
+
+statement ok
+CREATE TABLE fields (id INTEGER, s STRUCT(ip_type INTEGER, address BIGINT, mask INTEGER))
+
+statement ok
+INSERT INTO fields VALUES (1, {'ip_type': 1, 'address': 5, 'mask': 32}), (2, {'ip_type': 9, 'address': 5, 'mask': 32}), (3, NULL), (4, {'ip_type': 1, 'address': 6, 'mask': 40})
+
+query IIII
+SELECT id, s IS NULL, TRY_CAST(s AS INET), s FROM fields ORDER BY id
+----
+1	false	0.0.0.5	{'ip_type': 1, 'address': 5, 'mask': 32}
+2	false	NULL	{'ip_type': 9, 'address': 5, 'mask': 32}
+3	true	NULL	NULL
+4	false	NULL	{'ip_type': 1, 'address': 6, 'mask': 40}
+
+query III
+SELECT {'ip_type': 1::UTINYINT, 'address': 5::HUGEINT, 'mask': 32::USMALLINT}::INET, 'ffff::1'::INET::STRUCT(ip_type UTINYINT, address HUGEINT, mask USMALLINT)::INET, variant_extract({'a': 'ffff::1'::INET}::VARIANT, 'a')::INET
+----
+0.0.0.5	ffff::1	ffff::1

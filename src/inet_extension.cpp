@@ -251,9 +251,11 @@ static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastP
 }
 
 struct StructToInetCastData : public BoundCastData {
-	explicit StructToInetCastData(BoundCastInfo struct_cast_p) : struct_cast(std::move(struct_cast_p)) {
+	explicit StructToInetCastData(BoundCastInfo struct_cast_p)
+	    : fields_type(make_inet_struct_type()), struct_cast(std::move(struct_cast_p)) {
 	}
 
+	LogicalType fields_type;
 	BoundCastInfo struct_cast;
 
 	unique_ptr<BoundCastData> Copy() const override {
@@ -296,49 +298,40 @@ template <bool CIDR>
 static bool StructToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	auto &cast_data = parameters.cast_data->Cast<StructToInetCastData>();
 	CastParameters struct_parameters(parameters, cast_data.struct_cast.GetCastData(), parameters.local_state);
-	const auto converted = cast_data.struct_cast.Cast(source, result, count, struct_parameters);
-	const auto is_constant = result.GetVectorType() == VectorType::CONSTANT_VECTOR;
-	bool success = converted;
-	vector<idx_t> null_rows;
-	{
-		auto entries = result.Values<VectorStructType<uint8_t, hugeint_t, uint16_t>>();
-		for (idx_t i = 0; i < (is_constant ? 1 : count); i++) {
-			const auto entry = entries[i];
-			if (!entry.IsValid()) {
-				continue;
-			}
-			const auto ip_type = entry.template GetChildValue<INET_IP_TYPE_IDX>();
-			const auto address = entry.template GetChildValue<INET_ADDRESS_IDX>();
-			const auto mask = entry.template GetChildValue<INET_MASK_IDX>();
-			if (!ip_type.IsValid() || !address.IsValid() || !mask.IsValid()) {
-				null_rows.push_back(i);
-				continue;
-			}
-			auto reason = InvalidInetReason(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
-			if (!reason && CIDR &&
-			    HasHostBits(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe())) {
-				reason = "bits are set to the right of the mask";
-			}
-			if (reason) {
-				HandleCastError::AssignError(StringUtil::Format("Invalid %s value: %s", CIDR ? "CIDR" : "INET", reason),
-				                             parameters);
-				null_rows.push_back(i);
-				success = false;
-			}
+	Vector fields(cast_data.fields_type, count);
+	bool success = cast_data.struct_cast.Cast(source, fields, count, struct_parameters);
+	auto &entries = StructVector::GetEntries(result);
+	auto ip_types = FlatVector::GetDataMutable<uint8_t>(entries[INET_IP_TYPE_IDX]);
+	auto addresses = FlatVector::GetDataMutable<hugeint_t>(entries[INET_ADDRESS_IDX]);
+	auto masks = FlatVector::GetDataMutable<uint16_t>(entries[INET_MASK_IDX]);
+	auto values = fields.Values<VectorStructType<uint8_t, hugeint_t, uint16_t>>();
+	for (idx_t i = 0; i < count; i++) {
+		const auto entry = values[i];
+		if (!entry.IsValid()) {
+			FlatVector::SetNull(result, i, true);
+			continue;
 		}
-	}
-	if (null_rows.empty()) {
-		return success;
-	}
-	if (is_constant) {
-		ConstantVector::SetNull(result, true);
-		return success;
-	}
-	for (auto &child : StructVector::GetEntries(result)) {
-		child.Flatten(count);
-	}
-	for (const auto row : null_rows) {
-		FlatVector::SetNull(result, row, true);
+		const auto ip_type = entry.template GetChildValue<INET_IP_TYPE_IDX>();
+		const auto address = entry.template GetChildValue<INET_ADDRESS_IDX>();
+		const auto mask = entry.template GetChildValue<INET_MASK_IDX>();
+		if (!ip_type.IsValid() || !address.IsValid() || !mask.IsValid()) {
+			FlatVector::SetNull(result, i, true);
+			continue;
+		}
+		auto reason = InvalidInetReason(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
+		if (!reason && CIDR && HasHostBits(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe())) {
+			reason = "bits are set to the right of the mask";
+		}
+		if (reason) {
+			HandleCastError::AssignError(StringUtil::Format("Invalid %s value: %s", CIDR ? "CIDR" : "INET", reason),
+			                             parameters);
+			FlatVector::SetNull(result, i, true);
+			success = false;
+			continue;
+		}
+		ip_types[i] = ip_type.GetValueUnsafe();
+		addresses[i] = address.GetValueUnsafe();
+		masks[i] = mask.GetValueUnsafe();
 	}
 	return success;
 }
