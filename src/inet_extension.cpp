@@ -531,6 +531,67 @@ static void ContainsRightFunction(DataChunk &args, ExpressionState &state, Vecto
 	    [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> { return ContainsImplementation(rhs, lhs); });
 }
 
+static void StrictlyContainedByFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> {
+		    return lhs.c_val > rhs.c_val && ContainsImplementation(lhs, rhs);
+	    });
+}
+
+static void StrictlyContainsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> {
+		    return rhs.c_val > lhs.c_val && ContainsImplementation(rhs, lhs);
+	    });
+}
+
+static void OverlapsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> {
+		    return ContainsImplementation(lhs, rhs) || ContainsImplementation(rhs, lhs);
+	    });
+}
+
+static INET_T WithAddress(const INET_T &input, duckdb_uhugeint address, uint16_t mask) {
+	INET_T result;
+	result.a_val = input.a_val;
+	result.b_val = to_compatible_address(address, static_cast<INET_IPAddressType>(input.a_val));
+	result.c_val = mask;
+	return result;
+}
+
+static void BitwiseNotFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, INET_T>(args.data[0], result, args.size(), [](INET_T input) -> INET_T {
+		const auto type = static_cast<INET_IPAddressType>(input.a_val);
+		auto address = from_compatible_address(input.b_val, type);
+		if (type == INET_IP_ADDRESS_V4) {
+			address.upper = 0;
+			address.lower = ~address.lower & NumericLimits<uint32_t>::Maximum();
+		} else {
+			address.upper = ~address.upper;
+			address.lower = ~address.lower;
+		}
+		return WithAddress(input, address, input.c_val);
+	});
+}
+
+template <bool IS_AND>
+static void BitwiseBinaryFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, INET_T>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T lhs, INET_T rhs) -> INET_T {
+		    if (lhs.a_val != rhs.a_val) {
+			    throw InvalidInputException("cannot %s inet values of different sizes", IS_AND ? "AND" : "OR");
+		    }
+		    const auto type = static_cast<INET_IPAddressType>(lhs.a_val);
+		    const auto left = from_compatible_address(lhs.b_val, type);
+		    const auto right = from_compatible_address(rhs.b_val, type);
+		    duckdb_uhugeint address;
+		    address.upper = IS_AND ? left.upper & right.upper : left.upper | right.upper;
+		    address.lower = IS_AND ? left.lower & right.lower : left.lower | right.lower;
+		    return WithAddress(lhs, address, MaxValue(lhs.c_val, rhs.c_val));
+	    });
+}
+
 static constexpr idx_t INET_SORT_KEY_V4_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t) + sizeof(uint16_t);
 static constexpr idx_t INET_SORT_KEY_V6_SIZE = sizeof(uint8_t) + 2 * sizeof(uhugeint_t) + sizeof(uint16_t);
 static constexpr idx_t INET_SORT_KEY_MALFORMED_SIZE = 5 * sizeof(uint8_t) + sizeof(uhugeint_t) + sizeof(uint16_t);
@@ -742,6 +803,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction(">>=", {inet_type, inet_type}, LogicalType::BOOLEAN, ContainsRightFunction));
 	loader.RegisterFunction(ScalarFunction("subnet_contains_or_equals", {inet_type, inet_type}, LogicalType::BOOLEAN,
 	                                       ContainsRightFunction));
+	loader.RegisterFunction(
+	    ScalarFunction("<<", {inet_type, inet_type}, LogicalType::BOOLEAN, StrictlyContainedByFunction));
+	loader.RegisterFunction(
+	    ScalarFunction(">>", {inet_type, inet_type}, LogicalType::BOOLEAN, StrictlyContainsFunction));
+	loader.RegisterFunction(ScalarFunction("&&", {inet_type, inet_type}, LogicalType::BOOLEAN, OverlapsFunction));
+	loader.RegisterFunction(ScalarFunction("~", {inet_type}, inet_type, BitwiseNotFunction));
+	ScalarFunction and_fun("&", {inet_type, inet_type}, inet_type, BitwiseBinaryFunction<true>);
+	and_fun.SetFallible();
+	loader.RegisterFunction(and_fun);
+	ScalarFunction or_fun("|", {inet_type, inet_type}, inet_type, BitwiseBinaryFunction<false>);
+	or_fun.SetFallible();
+	loader.RegisterFunction(or_fun);
 	loader.RegisterFunction(ScalarFunction("inet_sort_key", {inet_type}, LogicalType::BLOB, InetSortKeyFunction));
 	CollationBinding::Get(loader.GetDatabaseInstance()).RegisterCollation(CollationCallback(GetInetCollationFunctions));
 

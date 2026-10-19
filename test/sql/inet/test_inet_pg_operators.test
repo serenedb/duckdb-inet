@@ -1,0 +1,50 @@
+# name: test/sql/inet/test_inet_pg_operators.test
+# description: PostgreSQL inet operators <<, >>, &&, ~, & and |
+# group: [inet]
+
+require inet
+
+query TTTTTT
+SELECT '10.1.0.0/16'::INET << '10.0.0.0/8'::INET, '10.0.0.0/8'::INET << '10.0.0.0/8'::INET, '10.1.2.3/24'::INET << '10.1.2.0/24'::INET, '10.1.2.3/25'::INET << '10.1.2.3/24'::INET, '10.0.0.0/8'::INET << '10.1.0.0/16'::INET, '10.0.0.0/8'::INET << '::/0'::INET
+----
+true	false	false	true	false	false
+
+query TTTT
+SELECT '10.0.0.0/8'::INET >> '10.1.0.0/16'::INET, '10.0.0.0/8'::INET >> '10.0.0.0/8'::INET, '10.1.2.3'::INET >> '10.1.2.3'::INET, '2001::/16'::INET >> '2001:db8::1'::INET
+----
+true	false	false	true
+
+query TTTTT
+SELECT '10.0.0.0/8'::INET && '10.1.0.0/16'::INET, '10.1.0.0/16'::INET && '10.0.0.0/8'::INET, '10.0.0.0/8'::INET && '10.0.0.0/8'::INET, '10.0.0.0/8'::INET && '11.0.0.0/8'::INET, '10.0.0.0/8'::INET && '::/0'::INET
+----
+true	true	true	false	false
+
+query TTTT
+SELECT ~ '10.1.2.3/24'::INET, ~ '0.0.0.0/0'::INET, ~ '::1'::INET, ~ '2001:db8::/32'::INET
+----
+245.254.253.252/24	255.255.255.255/0	ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe	dffe:f247:ffff:ffff:ffff:ffff:ffff:ffff/32
+
+query TTTT
+SELECT '10.1.2.3/24'::INET & '0.0.255.255/8'::INET, '10.1.2.3/8'::INET | '0.0.0.255/24'::INET, '2001:db8::1/64'::INET & 'ffff::/16'::INET, '2001:db8::/32'::INET | '::ff/128'::INET
+----
+0.0.2.3/24	10.1.2.255/24	2001::/64	2001:db8::ff
+
+query TTTT
+SELECT NULL::INET << '10.0.0.0/8'::INET, '10.0.0.0/8'::INET && NULL::INET, ~ NULL::INET, NULL::INET & '10.0.0.0/8'::INET
+----
+NULL	NULL	NULL	NULL
+
+query TTT
+SELECT '10.0.0.0/8'::CIDR << '0.0.0.0/0'::CIDR, '10.0.0.0/8'::CIDR >> '10.1.2.3'::INET, ~ '10.0.0.0/8'::CIDR
+----
+true	true	245.255.255.255/8
+
+statement error
+SELECT '10.1.2.3'::INET & '::1'::INET
+----
+cannot AND inet values of different sizes
+
+statement error
+SELECT '10.1.2.3'::INET | '::1'::INET
+----
+cannot OR inet values of different sizes
