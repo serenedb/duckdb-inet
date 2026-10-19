@@ -10,6 +10,7 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
+#include "duckdb/common/types/variant.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
@@ -168,7 +169,7 @@ static string_t escape_html(string_t input, bool input_quote, HTMLEscapeBuffer &
 	return string_t(result_data, result_size);
 }
 
-template <bool WITH_MASK>
+template <bool WITH_MASK, bool JSON = false>
 static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	StructTypeState<3> state;
 	state.PrepareVector(source);
@@ -190,8 +191,15 @@ static bool InetToVarcharCast(Vector &source, Vector &result, idx_t count, CastP
 		inet.mask = input.c_val;
 
 		char buffer[256];
-		size_t written = WITH_MASK ? cidr_to_string(&inet, buffer, sizeof(buffer))
-		                           : ipaddress_to_string(&inet, buffer, sizeof(buffer));
+		auto text = JSON ? buffer + 1 : buffer;
+		const auto text_size = JSON ? sizeof(buffer) - 2 : sizeof(buffer);
+		size_t written =
+		    WITH_MASK ? cidr_to_string(&inet, text, text_size) : ipaddress_to_string(&inet, text, text_size);
+		if (JSON) {
+			buffer[0] = '"';
+			buffer[written + 1] = '"';
+			written += 2;
+		}
 		result_data[i] = StringVector::AddString(result, buffer, written);
 	}
 	return true;
@@ -208,23 +216,49 @@ static BoundCastInfo BindInetToVarchar(BindCastInput &input, const LogicalType &
 	return BoundCastInfo(InetToVarcharCast<false>);
 }
 
+struct InetResult {
+	explicit InetResult(Vector &result_p)
+	    : result(result_p),
+	      ip_types(FlatVector::GetDataMutable<uint8_t>(StructVector::GetEntries(result)[INET_IP_TYPE_IDX])),
+	      addresses(FlatVector::GetDataMutable<hugeint_t>(StructVector::GetEntries(result)[INET_ADDRESS_IDX])),
+	      masks(FlatVector::GetDataMutable<uint16_t>(StructVector::GetEntries(result)[INET_MASK_IDX])) {
+	}
+
+	void Set(idx_t row, const INET_IPAddress &inet) {
+		ip_types[row] = static_cast<uint8_t>(inet.type);
+		addresses[row] = to_compatible_address(inet.address, inet.type);
+		masks[row] = inet.mask;
+	}
+
+	void SetStored(idx_t row, uint8_t ip_type, hugeint_t address, uint16_t mask) {
+		ip_types[row] = ip_type;
+		addresses[row] = address;
+		masks[row] = mask;
+	}
+
+	void SetNull(idx_t row) {
+		FlatVector::SetNull(result, row, true);
+	}
+
+	Vector &result;
+	uint8_t *ip_types;
+	hugeint_t *addresses;
+	uint16_t *masks;
+};
+
 template <bool CIDR>
-static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
-	UnifiedVectorFormat sdata;
-	source.ToUnifiedFormat(sdata);
-	auto strs = UnifiedVectorFormat::GetData<string_t>(sdata);
-	auto &entries = StructVector::GetEntries(result);
-	auto a = FlatVector::GetDataMutable<uint8_t>(entries[0]);
-	auto b = FlatVector::GetDataMutable<hugeint_t>(entries[1]);
-	auto c = FlatVector::GetDataMutable<uint16_t>(entries[2]);
+static bool TextToInet(Vector &text, idx_t count, optional_ptr<const SelectionVector> rows, InetResult &out,
+                       CastParameters &parameters) {
 	bool success = true;
+	auto values = text.Values<string_t>();
 	for (idx_t i = 0; i < count; i++) {
-		auto idx = sdata.sel->get_index(i);
-		if (!sdata.validity.RowIsValid(idx)) {
-			FlatVector::SetNull(result, i, true);
+		const auto row = rows ? rows->get_index(i) : i;
+		const auto entry = values[i];
+		if (!entry.IsValid()) {
+			out.SetNull(row);
 			continue;
 		}
-		const auto &input = strs[idx];
+		const auto &input = entry.GetValue();
 		INET_IPAddress inet;
 		try {
 			inet = ipaddress_from_string(input.GetData(), input.GetSize());
@@ -232,44 +266,72 @@ static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastP
 			HandleCastError::AssignError(StringUtil::Format("invalid input syntax for type %s: \"%s\"",
 			                                                CIDR ? "cidr" : "inet", input.GetString()),
 			                             parameters);
-			FlatVector::SetNull(result, i, true);
+			out.SetNull(row);
 			success = false;
 			continue;
 		}
 		if (CIDR && ipaddress_has_host_bits(&inet)) {
 			HandleCastError::AssignError(StringUtil::Format("invalid cidr value: \"%s\"", input.GetString()),
 			                             parameters);
-			FlatVector::SetNull(result, i, true);
+			out.SetNull(row);
 			success = false;
 			continue;
 		}
-		a[i] = (uint8_t)inet.type;
-		b[i] = to_compatible_address(inet.address, inet.type);
-		c[i] = inet.mask;
+		out.Set(row, inet);
 	}
 	return success;
 }
 
+template <bool CIDR>
+static bool VarcharToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	InetResult out(result);
+	return TextToInet<CIDR>(source, count, nullptr, out, parameters);
+}
+
 struct StructToInetCastData : public BoundCastData {
-	explicit StructToInetCastData(BoundCastInfo struct_cast_p)
-	    : fields_type(make_inet_struct_type()), struct_cast(std::move(struct_cast_p)) {
+	StructToInetCastData(BoundCastInfo to_fields_p, BoundCastInfo to_variant_p, BoundCastInfo to_text_p)
+	    : fields_type(make_inet_struct_type()), to_fields(std::move(to_fields_p)), to_variant(std::move(to_variant_p)),
+	      to_text(std::move(to_text_p)) {
 	}
 
 	LogicalType fields_type;
-	BoundCastInfo struct_cast;
+	BoundCastInfo to_fields;
+	BoundCastInfo to_variant;
+	BoundCastInfo to_text;
 
 	unique_ptr<BoundCastData> Copy() const override {
-		return make_uniq<StructToInetCastData>(struct_cast.Copy());
+		return make_uniq<StructToInetCastData>(to_fields.Copy(), to_variant.Copy(), to_text.Copy());
 	}
 };
 
-static unique_ptr<FunctionLocalState> InitStructToInetLocalState(CastLocalStateParameters &parameters) {
-	auto &cast_data = parameters.cast_data->Cast<StructToInetCastData>();
-	if (!cast_data.struct_cast.HasInitLocalState()) {
+struct StructToInetLocalState : public FunctionLocalState {
+	unique_ptr<FunctionLocalState> to_fields;
+	unique_ptr<FunctionLocalState> to_variant;
+	unique_ptr<FunctionLocalState> to_text;
+};
+
+static unique_ptr<FunctionLocalState> InitChildCastLocalState(CastLocalStateParameters &parameters,
+                                                              const BoundCastInfo &cast) {
+	if (!cast.HasFunction() || !cast.HasInitLocalState()) {
 		return nullptr;
 	}
-	CastLocalStateParameters struct_parameters(parameters, cast_data.struct_cast.GetCastData());
-	return cast_data.struct_cast.InitLocalState(struct_parameters);
+	CastLocalStateParameters child_parameters(parameters, cast.GetCastData());
+	return cast.InitLocalState(child_parameters);
+}
+
+static unique_ptr<FunctionLocalState> InitStructToInetLocalState(CastLocalStateParameters &parameters) {
+	auto &cast_data = parameters.cast_data->Cast<StructToInetCastData>();
+	auto result = make_uniq<StructToInetLocalState>();
+	result->to_fields = InitChildCastLocalState(parameters, cast_data.to_fields);
+	result->to_variant = InitChildCastLocalState(parameters, cast_data.to_variant);
+	result->to_text = InitChildCastLocalState(parameters, cast_data.to_text);
+	return std::move(result);
+}
+
+static bool RunChildCast(const BoundCastInfo &cast, const unique_ptr<FunctionLocalState> &local_state, Vector &source,
+                         Vector &result, idx_t count, CastParameters &parameters) {
+	CastParameters child_parameters(parameters, cast.GetCastData(), local_state.get());
+	return cast.Cast(source, result, count, child_parameters);
 }
 
 static const char *InvalidInetReason(uint8_t ip_type, hugeint_t address, uint16_t mask) {
@@ -295,27 +357,24 @@ static bool HasHostBits(uint8_t ip_type, hugeint_t address, uint16_t mask) {
 }
 
 template <bool CIDR>
-static bool StructToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
-	auto &cast_data = parameters.cast_data->Cast<StructToInetCastData>();
-	CastParameters struct_parameters(parameters, cast_data.struct_cast.GetCastData(), parameters.local_state);
+static bool FieldsToInet(const StructToInetCastData &cast_data, StructToInetLocalState &local_state, Vector &source,
+                         idx_t count, optional_ptr<const SelectionVector> rows, InetResult &out,
+                         CastParameters &parameters) {
 	Vector fields(cast_data.fields_type, count);
-	bool success = cast_data.struct_cast.Cast(source, fields, count, struct_parameters);
-	auto &entries = StructVector::GetEntries(result);
-	auto ip_types = FlatVector::GetDataMutable<uint8_t>(entries[INET_IP_TYPE_IDX]);
-	auto addresses = FlatVector::GetDataMutable<hugeint_t>(entries[INET_ADDRESS_IDX]);
-	auto masks = FlatVector::GetDataMutable<uint16_t>(entries[INET_MASK_IDX]);
+	bool success = RunChildCast(cast_data.to_fields, local_state.to_fields, source, fields, count, parameters);
 	auto values = fields.Values<VectorStructType<uint8_t, hugeint_t, uint16_t>>();
 	for (idx_t i = 0; i < count; i++) {
+		const auto row = rows ? rows->get_index(i) : i;
 		const auto entry = values[i];
 		if (!entry.IsValid()) {
-			FlatVector::SetNull(result, i, true);
+			out.SetNull(row);
 			continue;
 		}
 		const auto ip_type = entry.template GetChildValue<INET_IP_TYPE_IDX>();
 		const auto address = entry.template GetChildValue<INET_ADDRESS_IDX>();
 		const auto mask = entry.template GetChildValue<INET_MASK_IDX>();
 		if (!ip_type.IsValid() || !address.IsValid() || !mask.IsValid()) {
-			FlatVector::SetNull(result, i, true);
+			out.SetNull(row);
 			continue;
 		}
 		auto reason = InvalidInetReason(ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
@@ -325,22 +384,104 @@ static bool StructToInetCast(Vector &source, Vector &result, idx_t count, CastPa
 		if (reason) {
 			HandleCastError::AssignError(StringUtil::Format("Invalid %s value: %s", CIDR ? "CIDR" : "INET", reason),
 			                             parameters);
-			FlatVector::SetNull(result, i, true);
+			out.SetNull(row);
 			success = false;
 			continue;
 		}
-		ip_types[i] = ip_type.GetValueUnsafe();
-		addresses[i] = address.GetValueUnsafe();
-		masks[i] = mask.GetValueUnsafe();
+		out.SetStored(row, ip_type.GetValueUnsafe(), address.GetValueUnsafe(), mask.GetValueUnsafe());
+	}
+	return success;
+}
+
+static bool IsJSONString(const string_t &json) {
+	const auto data = json.GetData();
+	for (idx_t i = 0; i < json.GetSize(); i++) {
+		if (data[i] != ' ' && data[i] != '\t' && data[i] != '\n' && data[i] != '\r') {
+			return data[i] == '"';
+		}
+	}
+	return false;
+}
+
+template <bool CIDR>
+static bool JSONOrVariantToInet(const StructToInetCastData &cast_data, StructToInetLocalState &local_state,
+                                Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	SelectionVector text_rows(count);
+	SelectionVector field_rows(count);
+	idx_t text_count = 0;
+	idx_t field_count = 0;
+	if (cast_data.to_variant.HasFunction()) {
+		auto values = source.Values<string_t>();
+		for (idx_t i = 0; i < count; i++) {
+			const auto entry = values[i];
+			if (entry.IsValid() && IsJSONString(entry.GetValue())) {
+				text_rows.set_index(text_count++, i);
+			} else {
+				field_rows.set_index(field_count++, i);
+			}
+		}
+	} else {
+		RecursiveUnifiedVectorFormat format;
+		Vector::RecursiveToUnifiedFormat(source, format);
+		UnifiedVariantVectorData variant(format);
+		for (idx_t i = 0; i < count; i++) {
+			if (variant.RowIsValid(i) && variant.GetTypeId(i, 0) == VariantLogicalType::VARCHAR) {
+				text_rows.set_index(text_count++, i);
+			} else {
+				field_rows.set_index(field_count++, i);
+			}
+		}
+	}
+	InetResult out(result);
+	if (!text_count) {
+		return FieldsToInet<CIDR>(cast_data, local_state, source, count, nullptr, out, parameters);
+	}
+
+	bool success;
+	Vector text_source(source, text_rows, text_count);
+	Vector text(LogicalType::VARCHAR, text_count);
+	if (cast_data.to_variant.HasFunction()) {
+		Vector variant(LogicalType::VARIANT(), text_count);
+		success =
+		    RunChildCast(cast_data.to_variant, local_state.to_variant, text_source, variant, text_count, parameters);
+		success =
+		    RunChildCast(cast_data.to_text, local_state.to_text, variant, text, text_count, parameters) && success;
+	} else {
+		success = RunChildCast(cast_data.to_text, local_state.to_text, text_source, text, text_count, parameters);
+	}
+	success = TextToInet<CIDR>(text, text_count, text_rows, out, parameters) && success;
+	if (field_count) {
+		Vector field_source(source, field_rows, field_count);
+		success = FieldsToInet<CIDR>(cast_data, local_state, field_source, field_count, field_rows, out, parameters) &&
+		          success;
 	}
 	return success;
 }
 
 template <bool CIDR>
+static bool StructToInetCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	auto &cast_data = parameters.cast_data->Cast<StructToInetCastData>();
+	auto &local_state = parameters.local_state->Cast<StructToInetLocalState>();
+	if (cast_data.to_text.HasFunction()) {
+		return JSONOrVariantToInet<CIDR>(cast_data, local_state, source, result, count, parameters);
+	}
+	InetResult out(result);
+	return FieldsToInet<CIDR>(cast_data, local_state, source, count, nullptr, out, parameters);
+}
+
+template <bool CIDR>
 static BoundCastInfo BindStructToInetCast(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
-	auto struct_cast = input.GetCastFunction(source, make_inet_struct_type());
-	return BoundCastInfo(StructToInetCast<CIDR>, make_uniq<StructToInetCastData>(std::move(struct_cast)),
-	                     InitStructToInetLocalState);
+	BoundCastInfo to_variant(nullptr);
+	BoundCastInfo to_text(nullptr);
+	if (source.IsJSONType()) {
+		to_variant = input.GetCastFunction(source, LogicalType::VARIANT());
+	}
+	if (source.IsJSONType() || source.id() == LogicalTypeId::VARIANT) {
+		to_text = input.GetCastFunction(LogicalType::VARIANT(), LogicalType::VARCHAR);
+	}
+	auto cast_data = make_uniq<StructToInetCastData>(input.GetCastFunction(source, make_inet_struct_type()),
+	                                                 std::move(to_variant), std::move(to_text));
+	return BoundCastInfo(StructToInetCast<CIDR>, std::move(cast_data), InitStructToInetLocalState);
 }
 
 static void HostFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -783,6 +924,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterCastFunction(LogicalType::VARCHAR, cidr_type, BoundCastInfo(VarcharToInetCast<true>));
 	loader.RegisterCastFunction(cidr_type, inet_type, DefaultCasts::ReinterpretCast, 1);
 	loader.RegisterCastFunction(inet_type, cidr_type, BoundCastInfo(InetToCidrCast));
+	loader.RegisterCastFunction(inet_type, LogicalType::JSON(), BoundCastInfo(InetToVarcharCast<false, true>));
+	loader.RegisterCastFunction(cidr_type, LogicalType::JSON(), BoundCastInfo(InetToVarcharCast<true, true>));
 	loader.RegisterCombineTypesRule(CombineTypesRule {MatchesInetAndCidr, CombineInetAndCidr});
 	for (const auto &source : {LogicalType::STRUCT({{"any", LogicalType::ANY}}), LogicalType::TUPLE({LogicalType::ANY}),
 	                           LogicalType::JSON(), LogicalType::VARIANT()}) {
