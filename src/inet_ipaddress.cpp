@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdexcept>
+#include <string>
 
 static const int32_t HEX_BITSIZE = 4;
 static const int32_t MAX_QUIBBLE_DIGITS = 4;
@@ -330,6 +331,54 @@ INET_IPAddress ipaddress_from_string(const char *data, size_t size) {
 		return parse_ipv4(data, size);
 	}
 	throw std::runtime_error("Expected an IP address");
+}
+
+static uint16_t classful_mask(uint32_t first_octet, size_t octets) {
+	uint16_t bits = first_octet >= 240   ? 32
+	                : first_octet >= 224 ? 8
+	                : first_octet >= 192 ? 24
+	                : first_octet >= 128 ? 16
+	                                     : 8;
+	if (bits < octets * 8) {
+		bits = (uint16_t)(octets * 8);
+	}
+	if (bits == 8 && first_octet == 224) {
+		bits = 4;
+	}
+	return bits;
+}
+
+INET_IPAddress cidr_from_string(const char *data, size_t size) {
+	const std::string text(data, size);
+	const size_t slash = text.find('/');
+	const std::string address = text.substr(0, slash);
+	size_t octets = 1;
+	for (char ch : address) {
+		if (ch == ':') {
+			return ipaddress_from_string(data, size);
+		}
+		octets += ch == '.';
+	}
+	if (address.empty() || octets >= 4) {
+		return ipaddress_from_string(data, size);
+	}
+	std::string expanded = address;
+	for (size_t i = octets; i < 4; i++) {
+		expanded += ".0";
+	}
+	if (slash != std::string::npos) {
+		expanded += text.substr(slash);
+		return ipaddress_from_string(expanded.data(), expanded.size());
+	}
+	uint32_t first_octet = 0;
+	for (size_t i = 0; i < address.size() && address[i] != '.'; i++) {
+		if (!is_digit_char(address[i]) || first_octet > 255) {
+			return ipaddress_from_string(data, size);
+		}
+		first_octet = first_octet * 10 + (uint32_t)(address[i] - '0');
+	}
+	expanded += "/" + std::to_string(classful_mask(first_octet, octets));
+	return ipaddress_from_string(expanded.data(), expanded.size());
 }
 
 static size_t ipadress_to_string_ipv4(const INET_IPAddress *ip, char *buffer, size_t buffer_size) {

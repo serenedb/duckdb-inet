@@ -24,6 +24,8 @@ typedef struct {
 // The error_message does not need to be freed, it is a static string.
 INET_IPAddress ipaddress_from_string(const char *buffer, size_t buffer_size);
 
+INET_IPAddress cidr_from_string(const char *buffer, size_t buffer_size);
+
 // Returns length of string written to buffer. Returns 0 if buffer is too small.
 size_t ipaddress_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer_size);
 size_t cidr_to_string(const INET_IPAddress *ip, char *buffer, size_t buffer_size);

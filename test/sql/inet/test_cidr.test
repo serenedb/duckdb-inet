@@ -55,3 +55,25 @@ query I
 SELECT list(c::VARCHAR ORDER BY c) FROM (VALUES ('10.0.0.0/16'::CIDR), ('10.0.0.0/8'::CIDR), ('9.0.0.0/8'::CIDR)) t(c)
 ----
 [9.0.0.0/8, 10.0.0.0/8, 10.0.0.0/16]
+
+# a CIDR string may abbreviate an IPv4 network: the octets left out are zero, and without a netmask the
+# network's class gives it, widened to the octets written
+query IIIIII
+SELECT '10/8'::CIDR::VARCHAR, '128.1'::CIDR::VARCHAR, '192.168'::CIDR::VARCHAR, '10.1.2'::CIDR::VARCHAR, '224'::CIDR::VARCHAR, '10'::CIDR::VARCHAR
+----
+10.0.0.0/8	128.1.0.0/16	192.168.0.0/24	10.1.2.0/24	224.0.0.0/4	10.0.0.0/8
+
+statement error
+SELECT '10.1/8'::CIDR
+----
+invalid cidr value: "10.1/8"
+
+statement error
+SELECT '1.2.3.4.5'::CIDR
+----
+invalid input syntax for type cidr: "1.2.3.4.5"
+
+query II
+SELECT TRY_CAST('10.1/8' AS CIDR), TRY_CAST('10' AS INET)
+----
+NULL	NULL
