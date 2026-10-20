@@ -5,6 +5,7 @@
 #include "duckdb/inet/inet_type.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/bit_utils.hpp"
 #include "duckdb/common/bswap.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
@@ -745,6 +746,207 @@ static void BitwiseBinaryFunction(DataChunk &args, ExpressionState &state, Vecto
 	    });
 }
 
+static uint16_t FullMask(uint8_t ip_type) {
+	return ip_type == INET_IP_ADDRESS_V4 ? IPV4_DEFAULT_MASK : IPV6_DEFAULT_MASK;
+}
+
+static void MasklenFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, PrimitiveType<int32_t>>(
+	    args.data[0], result, args.size(), [](INET_T input) -> PrimitiveType<int32_t> { return input.c_val; });
+}
+
+static void HostmaskFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, INET_T>(args.data[0], result, args.size(), [](INET_T input) -> INET_T {
+		INET_IPAddress inet;
+		inet.type = static_cast<INET_IPAddressType>(input.a_val);
+		inet.mask = input.c_val;
+		return WithAddress(input, ipaddress_host_mask(&inet), FullMask(input.a_val));
+	});
+}
+
+template <bool CIDR>
+static void SetMasklenFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, PrimitiveType<int32_t>, INET_T>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T input, PrimitiveType<int32_t> length) -> INET_T {
+		    const int32_t full = FullMask(input.a_val);
+		    const int32_t bits = length.val == -1 ? full : length.val;
+		    if (bits < 0 || bits > full) {
+			    throw InvalidInputException("invalid mask length: %d", bits);
+		    }
+		    input.c_val = static_cast<uint16_t>(bits);
+		    return CIDR ? NetworkOf(input) : input;
+	    });
+}
+
+static void SameFamilyFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<bool>>(
+	    args.data[0], args.data[1], result, args.size(),
+	    [](INET_T lhs, INET_T rhs) -> PrimitiveType<bool> { return lhs.a_val == rhs.a_val; });
+}
+
+static void MergeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, INET_T>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T lhs, INET_T rhs) -> INET_T {
+		    if (lhs.a_val != rhs.a_val) {
+			    throw InvalidInputException("cannot merge addresses from different families");
+		    }
+		    const auto type = static_cast<INET_IPAddressType>(lhs.a_val);
+		    const auto left = from_compatible_address(lhs.b_val, type);
+		    const auto right = from_compatible_address(rhs.b_val, type);
+		    idx_t common;
+		    if (type == INET_IP_ADDRESS_V4) {
+			    common = CountZeros<uint32_t>::Leading(static_cast<uint32_t>(left.lower ^ right.lower));
+		    } else if (left.upper != right.upper) {
+			    common = CountZeros<uint64_t>::Leading(left.upper ^ right.upper);
+		    } else {
+			    common = 64 + CountZeros<uint64_t>::Leading(left.lower ^ right.lower);
+		    }
+		    lhs.c_val = static_cast<uint16_t>(MinValue<idx_t>(common, MinValue(lhs.c_val, rhs.c_val)));
+		    return NetworkOf(lhs);
+	    });
+}
+
+static void DifferenceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<INET_T, INET_T, PrimitiveType<int64_t>>(
+	    args.data[0], args.data[1], result, args.size(), [](INET_T lhs, INET_T rhs) -> PrimitiveType<int64_t> {
+		    if (lhs.a_val != rhs.a_val) {
+			    throw InvalidInputException("cannot subtract inet values of different sizes");
+		    }
+		    const auto type = static_cast<INET_IPAddressType>(lhs.a_val);
+		    const auto left = from_compatible_address(lhs.b_val, type);
+		    const auto right = from_compatible_address(rhs.b_val, type);
+		    const uint64_t borrow = left.lower < right.lower ? 1 : 0;
+		    const auto lower = static_cast<int64_t>(left.lower - right.lower);
+		    const uint64_t upper = left.upper - right.upper - borrow;
+		    if (upper != (lower < 0 ? NumericLimits<uint64_t>::Maximum() : 0)) {
+			    throw OutOfRangeException("result is out of range");
+		    }
+		    return lower;
+	    });
+}
+
+static void AddReversedFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteBinary<PrimitiveType<hugeint_t>, INET_T, INET_T>(
+	    args.data[0], args.data[1], result, args.size(),
+	    [](PrimitiveType<hugeint_t> lhs, INET_T rhs) -> INET_T { return AddImplementation(rhs, lhs.val); });
+}
+
+static void AppendCidrAbbrevV4(const uint8_t bytes[16], int bits, string &out) {
+	if (bits == 0) {
+		out += '0';
+	}
+	idx_t at = 0;
+	for (int b = bits / 8; b > 0; --b) {
+		out += std::to_string(bytes[at++]);
+		if (b > 1) {
+			out += '.';
+		}
+	}
+	if (const int b = bits % 8; b > 0) {
+		if (!out.empty()) {
+			out += '.';
+		}
+		out += std::to_string(bytes[at] & (((1U << b) - 1) << (8 - b)));
+	}
+	out += "/" + std::to_string(bits);
+}
+
+static void AppendCidrAbbrevV6(const uint8_t bytes[16], int bits, string &out) {
+	if (bits == 0) {
+		out += "::/0";
+		return;
+	}
+	uint8_t s[16] = {};
+	const int length = (bits + 7) / 8;
+	memcpy(s, bytes, length);
+	if (const int b = bits % 8; b != 0) {
+		s[length - 1] &= (uint8_t)(0xFF << (8 - b));
+	}
+	const int words = MaxValue((bits + 15) / 16, 2);
+	int zero_start = 0;
+	int zero_length = 0;
+	int run_start = 0;
+	int run_length = 0;
+	for (int i = 0; i < words * 2; i += 2) {
+		if ((s[i] | s[i + 1]) == 0) {
+			if (run_length == 0) {
+				run_start = i / 2;
+			}
+			++run_length;
+		} else if (run_length != 0 && zero_length < run_length) {
+			zero_start = run_start;
+			zero_length = run_length;
+			run_length = 0;
+		}
+	}
+	if (run_length != 0 && zero_length < run_length) {
+		zero_start = run_start;
+		zero_length = run_length;
+	}
+	const bool ipv4 = zero_length != words && zero_start == 0 &&
+	                  (zero_length == 6 || (zero_length == 5 && s[10] == 0xFF && s[11] == 0xFF) ||
+	                   (zero_length == 7 && s[14] != 0 && s[15] != 1));
+	idx_t at = 0;
+	for (int word = 0; word < words; ++word) {
+		if (zero_length != 0 && word >= zero_start && word < zero_start + zero_length) {
+			if (word == zero_start) {
+				out += ':';
+			}
+			if (word == words - 1) {
+				out += ':';
+			}
+			at += 2;
+			continue;
+		}
+		if (ipv4 && word > 5) {
+			out += word == 6 ? ':' : '.';
+			out += std::to_string(s[at++]);
+			if (word != 7 || bits > 120) {
+				out += '.';
+				out += std::to_string(s[at++]);
+			}
+		} else {
+			if (!out.empty()) {
+				out += ':';
+			}
+			out += StringUtil::Format("%x", s[at] * 256 + s[at + 1]);
+			at += 2;
+		}
+	}
+	out += "/" + std::to_string(bits);
+}
+
+template <bool CIDR>
+static void AbbrevFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	GenericExecutor::ExecuteUnary<INET_T, PrimitiveType<string_t>>(
+	    args.data[0], result, args.size(), [&](INET_T input) -> PrimitiveType<string_t> {
+		    INET_IPAddress inet;
+		    inet.type = static_cast<INET_IPAddressType>(input.a_val);
+		    inet.address = from_compatible_address(input.b_val, inet.type);
+		    inet.mask = input.c_val;
+		    if (!CIDR) {
+			    char buffer[64];
+			    return StringVector::AddString(result, buffer, ipaddress_to_string(&inet, buffer, sizeof(buffer)));
+		    }
+		    uint8_t bytes[16] = {};
+		    for (idx_t i = 0; i < 8; i++) {
+			    if (inet.type == INET_IP_ADDRESS_V6) {
+				    bytes[i] = static_cast<uint8_t>(inet.address.upper >> (56 - 8 * i));
+				    bytes[8 + i] = static_cast<uint8_t>(inet.address.lower >> (56 - 8 * i));
+			    } else if (i < 4) {
+				    bytes[i] = static_cast<uint8_t>(inet.address.lower >> (24 - 8 * i));
+			    }
+		    }
+		    string text;
+		    if (inet.type == INET_IP_ADDRESS_V6) {
+			    AppendCidrAbbrevV6(bytes, inet.mask, text);
+		    } else {
+			    AppendCidrAbbrevV4(bytes, inet.mask, text);
+		    }
+		    return StringVector::AddString(result, text);
+	    });
+}
+
 static constexpr idx_t INET_SORT_KEY_MALFORMED_SIZE = 5 * sizeof(uint8_t) + sizeof(uhugeint_t) + sizeof(uint16_t);
 static constexpr data_t INET_SORT_KEY_MALFORMED = 0xFF;
 
@@ -968,6 +1170,31 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction or_fun("|", {inet_type, inet_type}, inet_type, BitwiseBinaryFunction<false>);
 	or_fun.SetFallible();
 	loader.RegisterFunction(or_fun);
+	ScalarFunction add_reversed_fun("+", {LogicalType::HUGEINT, inet_type}, inet_type, AddReversedFunction);
+	add_reversed_fun.SetFallible();
+	loader.RegisterFunction(add_reversed_fun);
+	ScalarFunction difference_fun("-", {inet_type, inet_type}, LogicalType::BIGINT, DifferenceFunction);
+	difference_fun.SetFallible();
+	loader.RegisterFunction(difference_fun);
+	loader.RegisterFunction(ScalarFunction("masklen", {inet_type}, LogicalType::INTEGER, MasklenFunction));
+	loader.RegisterFunction(ScalarFunction("hostmask", {inet_type}, inet_type, HostmaskFunction));
+	ScalarFunctionSet set_masklen("set_masklen");
+	ScalarFunction set_inet_masklen({inet_type, LogicalType::INTEGER}, inet_type, SetMasklenFunction<false>);
+	set_inet_masklen.SetFallible();
+	set_masklen.AddFunction(set_inet_masklen);
+	ScalarFunction set_cidr_masklen({cidr_type, LogicalType::INTEGER}, cidr_type, SetMasklenFunction<true>);
+	set_cidr_masklen.SetFallible();
+	set_masklen.AddFunction(set_cidr_masklen);
+	loader.RegisterFunction(set_masklen);
+	ScalarFunctionSet abbrev("abbrev");
+	abbrev.AddFunction(ScalarFunction({inet_type}, LogicalType::VARCHAR, AbbrevFunction<false>));
+	abbrev.AddFunction(ScalarFunction({cidr_type}, LogicalType::VARCHAR, AbbrevFunction<true>));
+	loader.RegisterFunction(abbrev);
+	loader.RegisterFunction(
+	    ScalarFunction("inet_same_family", {inet_type, inet_type}, LogicalType::BOOLEAN, SameFamilyFunction));
+	ScalarFunction merge_fun("inet_merge", {inet_type, inet_type}, cidr_type, MergeFunction);
+	merge_fun.SetFallible();
+	loader.RegisterFunction(merge_fun);
 	loader.RegisterFunction(ScalarFunction("inet_sort_key", {inet_type}, LogicalType::BLOB, InetSortKeyFunction));
 	CollationBinding::Get(loader.GetDatabaseInstance()).RegisterCollation(CollationCallback(GetInetCollationFunctions));
 

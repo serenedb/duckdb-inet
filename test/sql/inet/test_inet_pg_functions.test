@@ -1,0 +1,90 @@
+# name: test/sql/inet/test_inet_pg_functions.test
+# description: PostgreSQL's network functions masklen, hostmask, set_masklen, abbrev, inet_same_family and inet_merge, inet - inet and integer + inet
+# group: [inet]
+
+require inet
+
+query IIII
+SELECT masklen('192.168.1.5/24'::INET), masklen('192.168.1.5'::INET), masklen('2001:db8::1/64'::INET), masklen('::1'::INET)
+----
+24	32	64	128
+
+query IIIII
+SELECT hostmask('192.168.23.20/30'::INET), hostmask('10.0.0.1'::INET), hostmask('0.0.0.0/0'::INET), hostmask('2001:db8::/64'::INET), hostmask('::/0'::INET)
+----
+0.0.0.3	0.0.0.0	255.255.255.255	::ffff:ffff:ffff:ffff	ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+query IIIII
+SELECT set_masklen('192.168.1.5/24'::INET, 16), set_masklen('192.168.1.5/24'::INET, -1), set_masklen('2001:db8::1/64'::INET, 48), set_masklen('2001:db8::1/64'::INET, -1), set_masklen('192.168.1.5'::INET, 0)
+----
+192.168.1.5/16	192.168.1.5	2001:db8::1/48	2001:db8::1	192.168.1.5/0
+
+query IIII
+SELECT set_masklen('192.168.1.0/24'::CIDR, 16)::VARCHAR, set_masklen('2001:db8:1::/48'::CIDR, 32)::VARCHAR, set_masklen('10.0.0.0/8'::CIDR, -1)::VARCHAR, typeof(set_masklen('10.0.0.0/8'::CIDR, 16))
+----
+192.168.0.0/16	2001:db8::/32	10.0.0.0/32	CIDR
+
+statement error
+SELECT set_masklen('192.168.1.5/24'::INET, 33)
+----
+invalid mask length: 33
+
+statement error
+SELECT set_masklen('::1'::INET, 129)
+----
+invalid mask length: 129
+
+statement error
+SELECT set_masklen('10.0.0.1'::INET, -2)
+----
+invalid mask length: -2
+
+query III
+SELECT abbrev('10.1.0.0/16'::INET), abbrev('10.1.0.0'::INET), abbrev('2001:db8::/32'::INET)
+----
+10.1.0.0/16	10.1.0.0	2001:db8::/32
+
+query IIIIIII
+SELECT abbrev('10.1.0.0/16'::CIDR), abbrev('192.168.0.0/24'::CIDR), abbrev('10.0.0.0/8'::CIDR), abbrev('0.0.0.0/0'::CIDR), abbrev('172.16.0.0/12'::CIDR), abbrev('10.1.2.3/32'::CIDR), abbrev('192.168.1.128/25'::CIDR)
+----
+10.1/16	192.168.0/24	10/8	0/0	172.16/12	10.1.2.3/32	192.168.1.128/25
+
+query IIIIIII
+SELECT abbrev('2001:db8::/32'::CIDR), abbrev('::/0'::CIDR), abbrev('2001:db8:0:1::/64'::CIDR), abbrev('::ffff:1.2.3.0/120'::CIDR), abbrev('::1.2.3.4/128'::CIDR), abbrev('fe80::/10'::CIDR), abbrev('ff00::/8'::CIDR)
+----
+2001:db8/32	::/0	2001:db8::1/64	::ffff:1.2.3/120	::1.2.3.4/128	fe80::/10	ff00::/8
+
+query IIIII
+SELECT inet_merge('10.1.2.3'::INET, '10.2.0.0/16'::INET)::VARCHAR, inet_merge('192.168.1.5/24'::INET, '192.168.2.5/24'::INET)::VARCHAR, inet_merge('2001:db8::1'::INET, '2001:db8::ff'::INET)::VARCHAR, inet_same_family('10.1.2.3'::INET, '::1'::INET), inet_same_family('10.1.2.3'::INET, '10.0.0.0/8'::CIDR)
+----
+10.0.0.0/14	192.168.0.0/22	2001:db8::/120	false	true
+
+query II
+SELECT inet_merge('10.1.2.3'::INET, '10.1.2.3'::INET)::VARCHAR, typeof(inet_merge('10.1.2.3'::INET, '10.2.0.0/16'::INET))
+----
+10.1.2.3/32	CIDR
+
+statement error
+SELECT inet_merge('10.1.2.3'::INET, '::1'::INET)
+----
+cannot merge addresses from different families
+
+query IIIII
+SELECT '10.1.2.3'::INET - '10.1.0.0'::INET, '10.0.0.0'::INET - '10.1.2.3'::INET, '2001:db8::'::INET - '2001:db8::ffff'::INET, 5 + '10.1.2.3'::INET, typeof('10.1.2.3'::INET - '10.1.0.0'::INET)
+----
+515	-66051	-65535	10.1.2.8	BIGINT
+
+statement error
+SELECT '10.1.2.3'::INET - '::1'::INET
+----
+cannot subtract inet values of different sizes
+
+statement error
+SELECT '::'::INET - 'ffff::'::INET
+----
+result is out of range
+
+query IIIIII
+SELECT masklen(NULL::INET), hostmask(NULL::INET), set_masklen(NULL::INET, 8), set_masklen('10.0.0.1'::INET, NULL), abbrev(NULL::INET), inet_merge(NULL::INET, '10.0.0.1'::INET)
+----
+NULL	NULL	NULL	NULL	NULL	NULL
