@@ -261,7 +261,8 @@ static bool TextToInet(Vector &text, idx_t count, optional_ptr<const SelectionVe
 		const auto &input = entry.GetValue();
 		INET_IPAddress inet;
 		try {
-			inet = ipaddress_from_string(input.GetData(), input.GetSize());
+			inet = CIDR ? cidr_from_string(input.GetData(), input.GetSize())
+			            : ipaddress_from_string(input.GetData(), input.GetSize());
 		} catch (const std::exception &) {
 			HandleCastError::AssignError(StringUtil::Format("invalid input syntax for type %s: \"%s\"",
 			                                                CIDR ? "cidr" : "inet", input.GetString()),
@@ -271,8 +272,12 @@ static bool TextToInet(Vector &text, idx_t count, optional_ptr<const SelectionVe
 			continue;
 		}
 		if (CIDR && ipaddress_has_host_bits(&inet)) {
-			HandleCastError::AssignError(StringUtil::Format("invalid cidr value: \"%s\"", input.GetString()),
-			                             parameters);
+			const auto message = StringUtil::Format("invalid cidr value: \"%s\"", input.GetString());
+			if (!parameters.error_message) {
+				throw Exception({{"detail", "Value has bits set to right of mask."}}, ExceptionType::CONVERSION,
+				                message);
+			}
+			HandleCastError::AssignError(message, parameters);
 			out.SetNull(row);
 			success = false;
 			continue;
