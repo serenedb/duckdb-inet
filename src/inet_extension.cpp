@@ -1216,7 +1216,11 @@ std::string InetExtension::Name() {
 }
 
 std::string InetExtension::Version() const {
-	return "v1.0.0";
+#ifdef EXT_VERSION_INET
+	return EXT_VERSION_INET;
+#else
+	return "";
+#endif
 }
 
 } // namespace duckdb
