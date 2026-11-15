@@ -132,6 +132,11 @@ SELECT html_unescape('no character references');
 ----
 no character references
 
+query II
+SELECT html_unescape('&#1;') = '', html_unescape('a&#1;b')
+----
+true	ab
+
 # test character references
 query I
 SELECT html_unescape('&no valid &charref;');

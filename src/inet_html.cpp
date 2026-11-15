@@ -256,7 +256,9 @@ static void decode_html_impl(const char *data, size_t size, html_decode_handle_f
 		}
 
 		// Emit the decoded text
-		handler(text_data, text_size, ctx);
+		if (text_size != 0) {
+			handler(text_data, text_size, ctx);
+		}
 	}
 }
 
